@@ -10,7 +10,7 @@ import logging
 import sys
 from dataclasses import asdict
 
-from . import auth, chngf, paths, refdata, uploader
+from . import auth, chngf, export, paths, refdata, uploader
 from .mapping import Mapping, match_all
 from .mesh_api import MAX_WORKERS, MeshClient, MeshError
 from .uploader import DAYS, Journal
@@ -209,19 +209,7 @@ def _load_all(args):
 
 
 def _print_plan(plan: uploader.Plan, verbose: bool):
-    print(plan.summary())
-    if verbose or not plan.existing:
-        for p in plan.items:
-            print("  +", p.describe(), f"| {p.note}" if p.note and verbose else "")
-    for l, r in plan.skipped:
-        print(f"  ! {l.cls} {DAYS[l.day]} {l.lesson + 1} {l.subject}{('/' + str(l.group)) if l.group else ''} ({l.teacher}): {r}")
-    if plan.existing:
-        for cur, p in plan.differs:
-            print(f"  ~ отличается (оставлено как есть): {p.describe()} | на сервере учитель {cur.get('teacher_name')}, кабинет {cur.get('room_name')}")
-        for it in plan.to_delete:
-            print("  - удалить:", uploader.describe_existing(it))
-        for p in plan.to_create:
-            print("  + создать:", p.describe())
+    print(export.plan_text(plan, verbose))
 
 
 def cmd_plan(args):
@@ -229,11 +217,16 @@ def cmd_plan(args):
     w1 = week1(args, tt, rd)
     client = make_client(args, rd) if args.online else None
     sel = selection(args, tt)
+    plans = []
     for week in weeks_for(args, sel, w1):
         plan = uploader.build_plan(tt, rd, m, week, w1, sel)
         if client:
             uploader.diff_plan(plan, uploader.fetch_existing(client, plan), args.replace, rd)
         _print_plan(plan, args.verbose)
+        plans.append(plan)
+    if args.export:
+        export.save_plans(args.export, plans)
+        print(f"План записан в {args.export}")
 
 
 def cmd_upload(args):
@@ -414,6 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("plan", help="показать, что будет создано (с --online — и сравнить с сервером)")
     common(p)
     p.add_argument("--online", action="store_true", help="сравнить с занятиями на сервере")
+    p.add_argument("--export", metavar="ФАЙЛ", help="записать план в файл: .csv — таблица для Excel, иначе текстовый отчёт")
     p.set_defaults(fn=cmd_plan)
 
     p = sub.add_parser("upload", help="синхронизировать неделю(и) с МЭШ (без --apply — пробный прогон)")

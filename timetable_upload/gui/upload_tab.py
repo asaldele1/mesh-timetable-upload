@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
     QCheckBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -25,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import uploader
+from .. import export, uploader
 from ..mesh_api import MAX_WORKERS
 from ..uploader import DAYS, Journal, Selection
 from .common import CheckListDialog, WrapDelegate, ask, cell, check_cell, error, make_table, scrollable
@@ -44,6 +46,7 @@ class UploadTab(QWidget):
         self.state = app.state
         self.plans: list[uploader.Plan] = []
         self.plans_online = False
+        self.shown: tuple[str, object] | None = None    # что сейчас в дереве: ("plan", планы) | ("result", итоги загрузки)
 
         split = QSplitter(Qt.Horizontal)
         lay = QHBoxLayout(self)
@@ -153,9 +156,17 @@ class UploadTab(QWidget):
         # ---------------------------------------------------------- правая панель: план
         right = QWidget()
         rl = QVBoxLayout(right)
+        srow = QHBoxLayout()
         self.summary = QLabel("План не построен.")
         self.summary.setWordWrap(True)
-        rl.addWidget(self.summary)
+        srow.addWidget(self.summary, 1)
+        self.export_btn = QPushButton("Сохранить в файл…")
+        self.export_btn.setToolTip("Записать показанный план или итоги загрузки (ошибки) в файл:\n"
+                                   ".csv — таблица для Excel, .txt — текстовый отчёт")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.export_shown)
+        srow.addWidget(self.export_btn, 0, Qt.AlignTop)
+        rl.addLayout(srow)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Занятие", "Подробности"])
         self.tree.setAlternatingRowColors(True)
@@ -320,6 +331,7 @@ class UploadTab(QWidget):
         if self.plans:
             self.plans = []
             self.summary.setText("Выбор изменился — постройте план заново.")
+            self._show(None)
         self.apply_btn.setEnabled(False)
 
     # ------------------------------------------------------------------ план
@@ -360,6 +372,7 @@ class UploadTab(QWidget):
                 return
             self.plans, self.plans_online = plans, online
             self.show_plans(self.describe_selection(weeks, sel))
+            self._show(("plan", plans))
             self.apply_btn.setEnabled(online and any(p.to_create or p.to_delete for p in plans))
 
         self.app.run(job, done, "Сравнение с сервером" if online else "Построение плана", stoppable=online)
@@ -405,6 +418,33 @@ class UploadTab(QWidget):
             lines.append(f"Итого занятий к переносу: {n_items}. Чтобы узнать, что из этого уже есть на сервере, нажмите «Сравнить с сервером».")
         self.summary.setText("\n".join(lines))
         self._fit_first_column()
+
+    # ------------------------------------------------------------------ экспорт
+    def _show(self, shown: tuple[str, object] | None):
+        self.shown = shown
+        self.export_btn.setEnabled(shown is not None)
+
+    def export_shown(self):
+        if self.shown is None:
+            return
+        kind, data = self.shown
+        name = "plan" if kind == "plan" else "upload-errors"
+        weeks = "-".join(str(p.week) for p in (data if kind == "plan" else [p for p, _ in data]))
+        start = os.path.join(self.state.settings.value("export/dir", os.path.expanduser("~")), f"{name}-week{weeks}.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить в файл", start,
+                                              "Таблица CSV для Excel (*.csv);;Текстовый отчёт (*.txt)")
+        if not path:
+            return
+        try:
+            if kind == "plan":
+                export.save_plans(path, data, self.summary.text())
+            else:
+                export.save_results(path, data)
+        except OSError as e:
+            error(self, "Сохранить в файл", f"Не удалось записать файл:\n{e}")
+            return
+        self.state.settings.setValue("export/dir", os.path.dirname(path))
+        self.app.log_text(f"{'План' if kind == 'plan' else 'Итоги загрузки'} записаны в {path}")
 
     def _fit_first_column(self):
         """Первая колонка по содержимому, но не шире половины дерева — остальное «Подробностям»."""
@@ -487,6 +527,7 @@ class UploadTab(QWidget):
                                  f"{' — план покажет, что осталось' if stopped else ''}.")
             self.plans = []
             self.apply_btn.setEnabled(False)
+            self._show(("result", results))
             st.changed.emit("journal")
             if errors:
                 error(self, "Загрузка", f"Ошибок: {len(errors)} — см. список в плане и журнал внизу окна.")

@@ -355,7 +355,7 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
     return plan
 
 
-def _item_kind(it: dict) -> str:
+def item_kind(it: dict) -> str:
     return "ec" if "ec_group_id" in it else "oo"
 
 
@@ -365,14 +365,14 @@ def _item_key(it: dict) -> tuple[str, int, str, int | str]:
         ds = f"{d[0]:04d}-{d[1]:02d}-{d[2]:02d}"
     else:
         ds = str(d)[:10]
-    if _item_kind(it) == "ec":
+    if item_kind(it) == "ec":
         return ("ec", it["ec_group_id"], ds, it["begin_time"])
     return ("oo", it["group_id"], ds, it["bell_id"])
 
 
 def _item_classes(it: dict, rd: RefData) -> set[int]:
     """Классы, к которым относится занятие на сервере."""
-    if _item_kind(it) == "ec":
+    if item_kind(it) == "ec":
         return set(it.get("class_unit_ids") or [])
     g = rd.group_by_id.get(it["group_id"])
     if g:
@@ -381,7 +381,7 @@ def _item_classes(it: dict, rd: RefData) -> set[int]:
 
 
 def describe_existing(it: dict) -> str:
-    if _item_kind(it) == "ec":
+    if item_kind(it) == "ec":
         return (f"ВД {it.get('date')} {it.get('begin_time')}–{it.get('end_time')} {it.get('ec_group_name')} "
                 f"({it.get('teacher_name')}, кабинет {it.get('room_id')}) id {it['id']}")
     return (f"{it.get('class_unit_name')} {it.get('date')} урок {it.get('lesson_number')} {it.get('group_name')} "
@@ -399,7 +399,7 @@ def diff_plan(plan: Plan, existing: list[dict], replace: bool, rd: RefData) -> N
     """
     # занятия недели вне выбранных дат (и другого вида, если план только для уроков/ВД) к плану не относятся
     existing = [it for it in existing if _dt.date.fromisoformat(_item_key(it)[2]) in plan.dates
-                and (plan.only is None or _item_kind(it) == plan.only)]
+                and (plan.only is None or item_kind(it) == plan.only)]
     plan.existing = existing
     by_key = {_item_key(it): it for it in existing}
     plan.to_create, plan.to_delete, plan.differs, plan.unchanged = [], [], [], 0
@@ -567,7 +567,7 @@ def apply_plan(client: MeshClient, plan: Plan, journal: Journal | None = None,
     deleted: set[ItemKey] = set()
 
     def delete(it: dict) -> None:
-        if _item_kind(it) == "ec":
+        if item_kind(it) == "ec":
             client.delete_ec_item(it["id"])
         else:
             client.delete_item(it.get("schedule_id") or plan.schedule_id, it["id"])
@@ -577,7 +577,7 @@ def apply_plan(client: MeshClient, plan: Plan, journal: Journal | None = None,
             res.errors.append((f"удаление: {describe_existing(it)}", outcome.message))
         else:
             res.deleted += 1
-            deleted.add((_item_kind(it), it["id"]))
+            deleted.add((item_kind(it), it["id"]))
             log.debug("удалено: %s", describe_existing(it))
         step()
         return (stop_on_error and bool(res.errors)) or stop_now()
