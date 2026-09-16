@@ -1,0 +1,113 @@
+name: Release
+
+# Релиз собирается по тегу vX.Y.Z (номер должен совпадать с __version__ в timetable_upload/__init__.py):
+#   git tag v0.1.0 && git push origin v0.1.0
+# Результат: в GitHub Releases появляются архивы с самостоятельными исполняемыми файлами
+# timetable-upload (консоль) и timetable-upload-gui (окно) для Windows и Linux.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x64
+          - os: ubuntu-22.04      # старый glibc — бинарник запустится и на более новых системах
+            platform: linux-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: System libraries for Qt and QtWebEngine (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libegl1 libopengl0 libxkbcommon0 libdbus-1-3 libfontconfig1 libglib2.0-0 \
+            libnss3 libxcomposite1 libxdamage1 libxrandr2 libxtst6 libxkbfile1 libasound2 libgbm1 libxcursor1 libcups2
+
+      - name: Install
+        run: pip install '.[gui]' pyinstaller
+
+      - name: Check version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          v="$(python -c 'import timetable_upload; print(timetable_upload.__version__)')"
+          if [ "v$v" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::__version__ = $v, tag = ${GITHUB_REF_NAME}"; exit 1
+          fi
+
+      - name: Tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QTWEBENGINE_DISABLE_SANDBOX: "1"     # песочница Chromium не работает в контейнере CI
+        run: pip install pytest && pytest -q
+
+      - name: Build
+        run: pyinstaller --clean --noconfirm packaging/timetable_upload.spec
+
+      - name: Smoke test
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QTWEBENGINE_DISABLE_SANDBOX: "1"
+        run: |
+          ext=""; [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+          ./dist/timetable-upload$ext --help >/dev/null
+          ./dist/timetable-upload$ext paths
+          ./dist/timetable-upload$ext info tests/data/demo.chngf
+          # окна должны подняться и жить, пока их не убьёт timeout (код 124)
+          rc=0; timeout 30 ./dist/timetable-upload-gui$ext || rc=$?
+          [ $rc -eq 124 ] || [ $rc -eq 0 ] || { echo "::error::GUI exited with $rc"; exit 1; }
+          # окно входа через mos.ru: проверяет, что QtWebEngine упакован (страница может и не открыться без сети)
+          rc=0; timeout 30 ./dist/timetable-upload-gui$ext --login || rc=$?
+          [ $rc -eq 124 ] || { echo "::error::GUI --login exited with $rc"; exit 1; }
+
+      - name: Package
+        run: |
+          name="timetable-upload-${GITHUB_REF_NAME#v}-${{ matrix.platform }}"
+          mkdir -p "out/$name"
+          cp dist/timetable-upload* "out/$name/"
+          cp README.md "out/$name/"
+          cd out
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "../$name.zip" "$name" >/dev/null
+          else
+            tar czf "../$name.tar.gz" "$name"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: |
+            timetable-upload-*.zip
+            timetable-upload-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

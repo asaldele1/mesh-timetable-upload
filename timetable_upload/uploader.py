@@ -1,0 +1,715 @@
+"""Построение плана переноса расписания на неделю МЭШ и его выполнение.
+
+План строится без обращения к серверу (по кэшу справочников и файлу
+сопоставления), затем сравнивается с уже существующими занятиями недели и
+применяется: лишние удаляются, недостающие создаются.  Повторный запуск с
+теми же данными ничего не меняет.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import fnmatch
+import json
+import logging
+import os
+import threading
+from collections import Counter
+from collections.abc import Callable, Iterable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
+
+from . import chngf
+from .mapping import GroupResolver, Mapping, is_ec, relevant_lessons
+from .mesh_api import MeshClient, MeshError
+from .refdata import RefData, norm_class, parse_ru_date
+
+log = logging.getLogger(__name__)
+DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+# ---------------------------------------------------------------------- что переносим
+def select_classes(spec: str | None, tt: chngf.Timetable) -> list[str] | None:
+    """Классы ХроноГрафа по описанию: «5а,5б» — имена, «5» — вся параллель, «10*» — шаблон;
+    через запятую.  None/пусто — все классы."""
+    if not spec or not spec.strip():
+        return None
+    names = [c.name for c in tt.classes]
+    by_norm = {norm_class(n): n for n in names}
+    out: list[str] = []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        key = norm_class(tok)
+        if key in by_norm:
+            found = [by_norm[key]]
+        elif key.isdigit():
+            found = [n for k, n in by_norm.items() if k.startswith(key) and not k[len(key):len(key) + 1].isdigit()]
+        elif any(ch in key for ch in "*?["):
+            found = [n for k, n in by_norm.items() if fnmatch.fnmatchcase(k, key)]
+        else:
+            found = []
+        if not found:
+            raise ValueError(f"класс {tok!r} не найден в файле (есть: {', '.join(names)})")
+        out.extend(n for n in found if n not in out)
+    return out
+
+
+_DAY_NAMES = {"пн": 0, "вт": 1, "ср": 2, "чт": 3, "пт": 4, "сб": 5, "вс": 6}
+
+
+def parse_days(spec: str | None) -> set[int] | None:
+    """Дни недели: «пн,ср», «1-3», «пн-пт» → индексы с 0 (понедельник).  None — все."""
+    if not spec or not spec.strip():
+        return None
+
+    def one(tok: str) -> int:
+        tok = tok.strip().lower().replace("ё", "е")
+        if tok in _DAY_NAMES:
+            return _DAY_NAMES[tok]
+        if tok.isdigit() and 1 <= int(tok) <= 7:
+            return int(tok) - 1
+        raise ValueError(f"день недели {tok!r} не распознан (пн…вс или 1…7)")
+
+    out: set[int] = set()
+    for part in spec.split(","):
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.update(range(one(a), one(b) + 1))
+        elif part.strip():
+            out.add(one(part))
+    return out
+
+
+def parse_dates(spec: str | None) -> set[_dt.date] | None:
+    """Даты: «2027-05-24», «24.05.2027», диапазон «2027-05-24..2027-05-28», через запятую."""
+    if not spec or not spec.strip():
+        return None
+
+    def one(tok: str) -> _dt.date:
+        tok = tok.strip()
+        for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+            try:
+                return _dt.datetime.strptime(tok, fmt).date()
+            except ValueError:
+                pass
+        raise ValueError(f"дата {tok!r} не распознана (ГГГГ-ММ-ДД или ДД.ММ.ГГГГ)")
+
+    out: set[_dt.date] = set()
+    for part in spec.split(","):
+        if ".." in part:
+            a, b = (one(x) for x in part.split("..", 1))
+            out.update(a + _dt.timedelta(days=i) for i in range((b - a).days + 1))
+        elif part.strip():
+            out.add(one(part))
+    return out
+
+
+@dataclass
+class Selection:
+    """Что именно переносить: классы, дни недели, конкретные даты, вид занятий."""
+    classes: list[str] | None = None      # имена классов ХроноГрафа; None — все
+    days: set[int] | None = None          # 0 = понедельник; None — все
+    dates: set[_dt.date] | None = None    # None — все даты выбранных недель
+    only: str | None = None               # "oo" — только уроки, "ec" — только ВД
+
+    def weeks(self, week1_monday: _dt.date) -> list[int]:
+        """Недели, в которые попадают выбранные даты."""
+        return sorted({(d - week1_monday).days // 7 + 1 for d in self.dates or ()})
+
+    def weeks_for(self, weeks: list[int] | None, week1_monday: _dt.date) -> list[int]:
+        """Недели к переносу: заданные явно и/или недели выбранных дат (пересечение, если есть и то
+        и другое); пустой список — ничего не выбрано."""
+        if self.dates:
+            by_dates = self.weeks(week1_monday)
+            return [w for w in by_dates if w in weeks] if weeks else by_dates
+        return list(weeks or [])
+
+    def week_dates(self, monday: _dt.date) -> set[_dt.date]:
+        """Даты недели, которые входят в выбор (по ним же ограничивается удаление при --replace)."""
+        out = {monday + _dt.timedelta(days=i) for i in range(7)
+               if self.days is None or i in self.days}
+        if self.dates is not None:
+            out &= self.dates
+        return out
+
+
+def week1_monday_for(tt: chngf.Timetable | None, override: _dt.date | None = None,
+                     academic_year: dict | None = None) -> _dt.date:
+    """Понедельник первой учебной недели: заданный явно; иначе неделя с датой начала учебного года
+    МЭШ (academic_year из кэша); иначе неделя с 1 сентября по учебному году файла."""
+    if override:
+        return override
+    begin = parse_ru_date((academic_year or {}).get("begin_date"))
+    if begin:
+        return begin - _dt.timedelta(days=begin.weekday())
+    if tt is None:
+        raise ValueError("не загружен файл расписания")
+    year = None
+    if tt.period_begin:
+        year = tt.period_begin.year if tt.period_begin.month >= 8 else tt.period_begin.year - 1
+    elif tt.teach_year and tt.teach_year[:4].isdigit():
+        year = int(tt.teach_year[:4])
+    if year is None:
+        raise ValueError("не удалось определить учебный год; задайте week1_monday явно")
+    sep1 = _dt.date(year, 9, 1)
+    return sep1 - _dt.timedelta(days=sep1.weekday())
+
+
+def _minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+@dataclass
+class PlannedItem:
+    lesson: chngf.Lesson
+    date: _dt.date
+    class_unit_id: int
+    class_unit_name: str
+    group_id: int
+    group_name: str
+    bell_id: int
+    teacher_id: int | None
+    room_id: int | None
+    building_id: int | None
+    note: str = ""
+    room_guessed: bool = False  # кабинет подобран по умолчанию, а не сопоставлен: при сравнении с сервером не учитывается
+    kind: str = "oo"            # "oo" — урок (группа предмета), "ec" — занятие внеурочной деятельности
+    begin_time: str = ""        # только для ВД: время по звонку класса
+    end_time: str = ""
+    duration: str = ""          # «00:45»
+
+    @property
+    def key(self) -> tuple[str, int, str, int | str]:
+        if self.kind == "ec":
+            return ("ec", self.group_id, self.date.isoformat(), self.begin_time)
+        return ("oo", self.group_id, self.date.isoformat(), self.bell_id)
+
+    def describe(self) -> str:
+        l = self.lesson
+        slot = f"{self.begin_time}–{self.end_time}" if self.kind == "ec" else f"звонок {self.bell_id}"
+        return (f"{l.cls} {DAYS[l.day]} {l.lesson + 1}: {l.subject}{('/' + str(l.group)) if l.group else ''} — "
+                f"{l.teacher or '—'} [{l.cabinet or '—'}] → {'группа ВД' if self.kind == 'ec' else 'группа'} "
+                f"{self.group_id} «{self.group_name}», учитель {self.teacher_id or '—'}, "
+                f"кабинет {self.room_id or '—'}, {slot}, {self.date}")
+
+
+@dataclass
+class Plan:
+    week: int
+    schedule_id: int
+    ec_schedule_id: int | None = None        # расписание ВД недели; None — на сервере ещё не создано
+    dates: set[_dt.date] = field(default_factory=set)   # даты недели, охваченные планом
+    only: str | None = None                  # "oo"/"ec" — план охватывает только уроки / только ВД
+    cycle_week: int = 0                      # неделя цикла ХроноГрафа (с 0), взятая для этой недели МЭШ
+    cycle_weeks: int = 1                     # число недель в цикле файла
+    items: list[PlannedItem] = field(default_factory=list)
+    skipped: list[tuple[chngf.Lesson, str]] = field(default_factory=list)
+    class_unit_ids: set[int] = field(default_factory=set)
+    # заполняется после сравнения с сервером
+    existing: list[dict] = field(default_factory=list)
+    to_create: list[PlannedItem] = field(default_factory=list)
+    to_delete: list[dict] = field(default_factory=list)
+    differs: list[tuple[dict, PlannedItem]] = field(default_factory=list)   # есть на сервере, но с другим учителем/кабинетом
+    unchanged: int = 0
+
+    def summary(self) -> str:
+        reasons = Counter(r.split(":")[0] for _, r in self.skipped)
+        n_ec = sum(1 for p in self.items if p.kind == "ec")
+        span = ""
+        if self.dates:
+            lo, hi = min(self.dates), max(self.dates)
+            span = f", {lo}" + (f" — {hi}" if hi != lo else "") + (f" ({len(self.dates)} дн.)" if len(self.dates) < 7 else "")
+        cycle = f", {self.cycle_week + 1}-я неделя цикла" if self.cycle_weeks > 1 else ""
+        s = [f"неделя {self.week}{span}{cycle} (schedule_id {self.schedule_id}, ВД {self.ec_schedule_id or 'не создано'}): "
+             f"занятий к переносу {len(self.items)} (уроков {len(self.items) - n_ec}, ВД {n_ec}), "
+             f"пропущено {len(self.skipped)}"]
+        for r, n in reasons.most_common():
+            s.append(f"    пропуск — {r}: {n}")
+        if self.existing or self.to_create or self.to_delete:
+            s.append(f"  на сервере сейчас {len(self.existing)}; создать {len(self.to_create)}, "
+                     f"удалить {len(self.to_delete)}, без изменений {self.unchanged}, отличаются (не трогаем) {len(self.differs)}")
+        return "\n".join(s)
+
+
+def default_room(rd: RefData, teacher_id: int | None, building_id: int | None) -> tuple[int | None, int | None]:
+    """Кабинет по умолчанию — повторяет логику веб-интерфейса МЭШ: здания учителя (сначала здание
+    расписания звонков класса), в них — кабинет учителя, иначе первый кабинет здания; в крайнем
+    случае — первый кабинет в списке."""
+    rooms = [r for r in rd.rooms if not r.get("deleted_at")]
+    t = rd.teacher_by_id.get(teacher_id) or {}
+    buildings = [b["id"] for b in t.get("buildings") or [] if b.get("id")]
+    buildings.sort(key=lambda b: 0 if b == building_id else 1)
+    own = [rd.room_by_id[i] for i in t.get("room_ids") or [] if i in rd.room_by_id]
+    for pool in (own, rooms):
+        for b in buildings:
+            r = next((r for r in pool if r.get("building_id") == b), None)
+            if r:
+                return r["id"], b
+    if rooms:
+        return rooms[0]["id"], rooms[0].get("building_id")
+    return None, None
+
+
+def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
+               week1_monday: _dt.date, sel: Selection | None = None) -> Plan:
+    """План на неделю МЭШ.  Для файла с циклом из нескольких недель берётся неделя цикла по номеру
+    недели МЭШ: неделя 1 — первая неделя цикла, 2 — вторая и т. д. по кругу."""
+    sel = sel or Selection()
+    sched = rd.schedule_by_week.get(week)
+    if not sched:
+        raise ValueError(f"в кэше нет расписания для недели {week} (есть недели {min(rd.schedule_by_week)}–{max(rd.schedule_by_week)})")
+    ec_sched = rd.ec_schedule_by_week.get(week)
+    monday = week1_monday + _dt.timedelta(days=7 * (week - 1))
+    cycle_weeks = max(1, tt.week_count)
+    plan = Plan(week=week, schedule_id=sched["id"], ec_schedule_id=ec_sched["id"] if ec_sched else None,
+                dates=sel.week_dates(monday), only=sel.only,
+                cycle_week=(week - 1) % cycle_weeks, cycle_weeks=cycle_weeks)
+    seen: dict[tuple, PlannedItem] = {}
+    lessons = relevant_lessons(tt, m)
+    if sel.classes is not None:
+        wanted = set(sel.classes)
+        lessons = [l for l in lessons if l.cls in wanted]
+    lessons = [l for l in lessons if l.week == plan.cycle_week and monday + _dt.timedelta(days=l.day) in plan.dates]
+    bells_cache: dict[tuple[int, _dt.date], dict | None] = {}
+    resolver = GroupResolver(tt, rd, m)
+    for l in lessons:
+        cu_name = m.classes.get(l.cls)
+        cu = rd.class_unit(cu_name) if cu_name else None
+        if not cu:
+            plan.skipped.append((l, "класс не сопоставлен"))
+            continue
+        teacher_id = m.teachers.get(l.teacher) if l.teacher else None
+        if teacher_id is not None and rd.teacher_deleted(teacher_id):    # сервер удалённый профиль не примет
+            plan.skipped.append((l, f"учитель удалён в МЭШ: {rd.teacher_by_id[teacher_id].get('name')} (id {teacher_id})"))
+            continue
+        g, why = resolver.resolve(l)
+        if not g:
+            plan.skipped.append((l, f"группа не найдена: {why}"))
+            continue
+        group_teachers = [t["id"] for t in g.get("teachers") or [] if t.get("id")]
+        if teacher_id is None:
+            if len(group_teachers) == 1:
+                teacher_id = group_teachers[0]
+                why += "; учитель взят из группы"
+            else:
+                plan.skipped.append((l, "учитель не сопоставлен"))
+                continue
+        # сервер принимает только учителя, привязанного к группе (удалённые из списка группы уже убраны)
+        if group_teachers and teacher_id not in group_teachers:
+            names = [t.get("full_name") for t in g.get("teachers") or []]
+            plan.skipped.append((l, f"учитель не привязан к группе МЭШ: в группе «{g['name']}» — {names}"))
+            continue
+        date = monday + _dt.timedelta(days=l.day)
+        if (cu["id"], date) not in bells_cache:
+            bells_cache[(cu["id"], date)] = rd.bells_timetable_for(cu["id"], date)
+        bt = bells_cache[(cu["id"], date)]
+        if not bt:
+            plan.skipped.append((l, "нет расписания звонков: классу не назначено расписание звонков на эту дату"))
+            continue
+        bell = rd.bell_for(bt, l.day + 1, l.lesson + 1)
+        if not bell:
+            plan.skipped.append((l, f"нет звонка: урок {l.lesson + 1} отсутствует в расписании звонков «{bt.get('name')}» "
+                                    f"({DAYS[l.day]}: уроки {rd.lesson_numbers(bt, l.day + 1)})"))
+            continue
+        room_id = m.rooms.get(l.cabinet) if l.cabinet else None
+        room_guessed = False
+        if room_id:
+            building_id = rd.room_by_id[room_id]["building_id"]
+        elif is_ec(g):
+            # для ВД кабинет не обязателен, а занятость кабинета сервер проверяет — не подставляем
+            room_id = building_id = None
+            if l.cabinet:
+                why += "; кабинет не сопоставлен — занятие без кабинета"
+        else:
+            # сервер требует кабинет; как и веб-интерфейс, берём кабинет учителя в здании класса,
+            # иначе первый кабинет этого здания.  Это догадка: с кабинетом на сервере не сравнивается
+            room_id, building_id = default_room(rd, teacher_id, bt.get("building_id"))
+            if room_id is None:
+                plan.skipped.append((l, "нет кабинета: не сопоставлен и не удалось подобрать по умолчанию"))
+                continue
+            room_guessed = True
+            why += ("; кабинет не сопоставлен" if l.cabinet else "; кабинет не задан") + \
+                   f" — подставлен «{rd.room_by_id[room_id].get('name')}»"
+        item = PlannedItem(l, date, cu["id"], cu["name"], g["id"], g["name"], bell["id"],
+                           teacher_id, room_id, building_id, why, room_guessed)
+        if is_ec(g):
+            # занятие ВД задаётся временем, а не звонком: берём границы звонка класса
+            begin, end = bell.get("begin_time") or "", bell.get("end_time") or ""
+            minutes = _minutes(end) - _minutes(begin) if begin and end else 0
+            if minutes not in m.ec_durations:
+                plan.skipped.append((l, f"длительность звонка не подходит для ВД: {begin}–{end} ({minutes} мин; "
+                                        f"допустимо {'/'.join(map(str, m.ec_durations))})"))
+                continue
+            item.kind, item.begin_time, item.end_time, item.duration = "ec", begin, end, f"00:{minutes:02d}"
+        if sel.only and item.kind != sel.only:
+            continue
+        if item.key in seen:
+            # поток: несколько классов ведут на одну метагруппу — одно занятие
+            continue
+        seen[item.key] = item
+        plan.items.append(item)
+        plan.class_unit_ids.add(cu["id"])
+    return plan
+
+
+def _item_kind(it: dict) -> str:
+    return "ec" if "ec_group_id" in it else "oo"
+
+
+def _item_key(it: dict) -> tuple[str, int, str, int | str]:
+    d = it.get("date")
+    if isinstance(d, list):
+        ds = f"{d[0]:04d}-{d[1]:02d}-{d[2]:02d}"
+    else:
+        ds = str(d)[:10]
+    if _item_kind(it) == "ec":
+        return ("ec", it["ec_group_id"], ds, it["begin_time"])
+    return ("oo", it["group_id"], ds, it["bell_id"])
+
+
+def _item_classes(it: dict, rd: RefData) -> set[int]:
+    """Классы, к которым относится занятие на сервере."""
+    if _item_kind(it) == "ec":
+        return set(it.get("class_unit_ids") or [])
+    g = rd.group_by_id.get(it["group_id"])
+    if g:
+        return set(g.get("class_unit_ids") or []) | ({g["class_unit_id"]} if g.get("class_unit_id") else set())
+    return {it["class_unit_id"]} if it.get("class_unit_id") else set()
+
+
+def describe_existing(it: dict) -> str:
+    if _item_kind(it) == "ec":
+        return (f"ВД {it.get('date')} {it.get('begin_time')}–{it.get('end_time')} {it.get('ec_group_name')} "
+                f"({it.get('teacher_name')}, кабинет {it.get('room_id')}) id {it['id']}")
+    return (f"{it.get('class_unit_name')} {it.get('date')} урок {it.get('lesson_number')} {it.get('group_name')} "
+            f"({it.get('teacher_name')}, {it.get('room_name')}) id {it['id']}")
+
+
+def diff_plan(plan: Plan, existing: list[dict], replace: bool, rd: RefData) -> None:
+    """Сравнивает план с занятиями недели на сервере.
+
+    replace=False — только добавлять недостающие; существующие занятия не трогаются
+    (если у них другой учитель/кабинет — попадают в plan.differs как предупреждение);
+    replace=True — кроме того, удалять занятия наших классов на охваченные планом даты,
+    которых нет в плане, и пересоздавать отличающиеся.  Кабинет сравнивается только
+    сопоставленный: подставленный по умолчанию (room_guessed) — не повод трогать занятие.
+    """
+    # занятия недели вне выбранных дат (и другого вида, если план только для уроков/ВД) к плану не относятся
+    existing = [it for it in existing if _dt.date.fromisoformat(_item_key(it)[2]) in plan.dates
+                and (plan.only is None or _item_kind(it) == plan.only)]
+    plan.existing = existing
+    by_key = {_item_key(it): it for it in existing}
+    plan.to_create, plan.to_delete, plan.differs, plan.unchanged = [], [], [], 0
+    planned_keys = set()
+    for p in plan.items:
+        planned_keys.add(p.key)
+        cur = by_key.get(p.key)
+        if cur is None:
+            plan.to_create.append(p)
+        elif cur.get("teacher_id") != p.teacher_id or (p.room_id and not p.room_guessed and cur.get("room_id") != p.room_id):
+            if replace:
+                plan.to_delete.append(cur)
+                plan.to_create.append(p)
+            else:
+                plan.differs.append((cur, p))
+        else:
+            plan.unchanged += 1
+    if replace:
+        for it in existing:
+            if _item_key(it) in planned_keys:
+                continue
+            cus = _item_classes(it, rd)
+            if cus and cus <= plan.class_unit_ids:
+                plan.to_delete.append(it)
+
+
+def fetch_existing(client: MeshClient, plan: Plan) -> list[dict]:
+    """Занятия недели на сервере по классам плана: уроки и занятия ВД."""
+    if not plan.class_unit_ids:
+        return []
+    cu_ids = sorted(plan.class_unit_ids)
+    items = client.schedule_items(plan.week, cu_ids)
+    if plan.ec_schedule_id:
+        items += client.ec_schedule_items(plan.ec_schedule_id, cu_ids)
+    return [it for it in items if not it.get("cancelled")]
+
+
+@dataclass
+class ApplyResult:
+    created: int = 0
+    deleted: int = 0
+    errors: list[tuple[str, str]] = field(default_factory=list)
+    stopped: bool = False      # прервано по should_stop — часть плана не выполнена
+
+
+StopCheck = Callable[[], bool]      # «пора остановиться?» — опрашивается перед каждым запросом к серверу
+
+
+ItemKey = tuple[str, int]      # (вид занятия "oo"/"ec", id на сервере): у уроков и занятий ВД разные нумерации
+
+
+def journal_key(rec: dict) -> ItemKey:
+    return (rec.get("kind") or "oo", rec.get("item_id"))
+
+
+class Journal:
+    """Журнал созданных занятий (JSON Lines) — по нему :func:`undo` удаляет ровно то, что создали мы."""
+
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()       # запись из нескольких потоков (workers)
+
+    def record(self, plan: Plan, item: PlannedItem, item_id: int) -> None:
+        rec = {"created_at": _dt.datetime.now().isoformat(timespec="seconds"), "kind": item.kind,
+               "week": plan.week, "schedule_id": plan.ec_schedule_id if item.kind == "ec" else plan.schedule_id,
+               "item_id": item_id,
+               "class": item.lesson.cls, "class_unit_id": item.class_unit_id, "group_id": item.group_id,
+               "group_name": item.group_name, "date": item.date.isoformat(), "lesson": item.lesson.lesson + 1,
+               "teacher_id": item.teacher_id, "room_id": item.room_id}
+        if item.kind == "ec":
+            rec["begin_time"] = item.begin_time
+        with self._lock, open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def remove(self, keys: set[ItemKey]) -> None:
+        self.rewrite([r for r in self.read() if journal_key(r) not in keys])
+
+    def rewrite(self, recs: list[dict]) -> None:
+        """Заменить содержимое журнала на recs."""
+        with self._lock, open(self.path, "w", encoding="utf-8") as f:
+            for rec in recs:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def read(self) -> list[dict]:
+        if not os.path.exists(self.path):
+            return []
+        with open(self.path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+
+def _created_id(resp) -> int:
+    """id созданного объекта из ответа сервера; ответ без id (не JSON, пустой) — ошибка,
+    после которой факт создания перепроверяется по серверу."""
+    if isinstance(resp, dict) and resp.get("id"):
+        return int(resp["id"])
+    raise MeshError(200, f"сервер не вернул id созданного объекта: {str(resp)[:200]}", resp)
+
+
+def run_parallel(fn: Callable, items: Iterable, workers: int, each: Callable[[object, object], bool]) -> bool:
+    """Выполняет ``fn(item)`` для всех items, держа в работе не больше ``workers`` запросов сразу.
+
+    ``each(item, outcome)`` вызывается в вызывающем потоке по завершении каждого: outcome — результат
+    либо :class:`MeshError`. Вернула True — новых запросов не начинать (начатые довыполняются и тоже
+    проходят через ``each``); тогда и run_parallel возвращает True. Прочие исключения — наружу."""
+    todo = iter(items)
+    stopped = False
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        running: dict = {}
+
+        def submit_next() -> bool:
+            for item in todo:
+                running[ex.submit(fn, item)] = item
+                return True
+            return False
+
+        for _ in range(max(1, workers)):
+            if not submit_next():
+                break
+        while running:
+            finished, _ = wait(running, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                item = running.pop(fut)
+                try:
+                    outcome = fut.result()
+                except MeshError as e:
+                    outcome = e
+                if each(item, outcome):
+                    stopped = True
+                elif not stopped:
+                    submit_next()
+    return stopped
+
+
+def apply_plan(client: MeshClient, plan: Plan, journal: Journal | None = None,
+               stop_on_error: bool = False, progress=None, should_stop: StopCheck | None = None,
+               workers: int = 1) -> ApplyResult:
+    """Выполняет план: расписание ВД недели (если его нет), затем удаления, затем создания.
+    progress(done, total) — обратный вызов; should_stop() == True — остановиться перед очередным
+    занятием (сделанное остаётся в журнале, результат помечается ``stopped``); workers — сколько
+    запросов слать одновременно (фазы удаления и создания не смешиваются)."""
+    res = ApplyResult()
+    total = len(plan.to_delete) + len(plan.to_create)
+    done = 0
+    failed: list[PlannedItem] = []
+    ec_error = ""
+
+    def stop_now() -> bool:
+        return bool(should_stop and should_stop())
+
+    def step():
+        nonlocal done
+        done += 1
+        if progress:
+            progress(done, total)
+    if plan.ec_schedule_id is None and any(p.kind == "ec" for p in plan.to_create):
+        # до удалений: если расписание ВД не создать, занятия ВД не создать тоже — лучше узнать заранее
+        try:
+            plan.ec_schedule_id = _created_id(client.create_ec_schedule(plan.week))
+            log.info("создано расписание ВД недели %s: id %s", plan.week, plan.ec_schedule_id)
+        except MeshError as e:
+            ec_error = e.message
+            res.errors.append((f"создание расписания ВД недели {plan.week}", e.message))
+            if stop_on_error:
+                return res
+    deleted: set[ItemKey] = set()
+
+    def delete(it: dict) -> None:
+        if _item_kind(it) == "ec":
+            client.delete_ec_item(it["id"])
+        else:
+            client.delete_item(it.get("schedule_id") or plan.schedule_id, it["id"])
+
+    def after_delete(it: dict, outcome) -> bool:
+        if isinstance(outcome, MeshError):
+            res.errors.append((f"удаление: {describe_existing(it)}", outcome.message))
+        else:
+            res.deleted += 1
+            deleted.add((_item_kind(it), it["id"]))
+            log.debug("удалено: %s", describe_existing(it))
+        step()
+        return (stop_on_error and bool(res.errors)) or stop_now()
+
+    if plan.to_delete:
+        if stop_now():
+            res.stopped = True
+        elif run_parallel(delete, plan.to_delete, workers, after_delete):
+            res.stopped = not (stop_on_error and res.errors)
+    if journal and deleted:
+        journal.remove(deleted)
+    if res.stopped or (stop_on_error and res.errors):
+        return res
+
+    def create(p: PlannedItem) -> int:
+        if p.kind == "ec":
+            if plan.ec_schedule_id is None:
+                raise MeshError(0, f"расписание ВД недели не создано: {ec_error}")
+            created = client.create_ec_item(plan.ec_schedule_id, p.group_id, p.date, p.begin_time, p.end_time,
+                                            p.duration, p.teacher_id, p.room_id, p.building_id)
+        else:
+            created = client.create_item(plan.schedule_id, p.group_id, p.bell_id, p.date,
+                                         p.teacher_id, p.room_id, p.building_id)
+        item_id = _created_id(created)
+        if journal:
+            journal.record(plan, p, item_id)      # сразу в рабочем потоке: созданное не потеряется
+        log.debug("создано: %s", p.describe())
+        return item_id
+
+    def after_create(p: PlannedItem, outcome) -> bool:
+        if isinstance(outcome, MeshError):
+            res.errors.append((p.describe(), outcome.message))
+            failed.append(p)
+        else:
+            res.created += 1
+        step()
+        return (stop_on_error and bool(res.errors)) or stop_now()
+
+    if plan.to_create:
+        if stop_now():
+            res.stopped = True
+        elif run_parallel(create, plan.to_create, workers, after_create):
+            res.stopped = not (stop_on_error and res.errors)
+    if failed:
+        # ответ мог не дойти (обрыв запроса) или прийти без id, а занятие — создаться: сверяемся с сервером
+        existing = {_item_key(it): it for it in fetch_existing(client, plan)}
+        for p in failed:
+            it = existing.get(p.key)
+            if it is not None:
+                res.created += 1
+                res.errors = [e for e in res.errors if e[0] != p.describe()]
+                if journal:
+                    journal.record(plan, p, it["id"])
+    return res
+
+
+def journal_matches(rec: dict, weeks: list[int] | None, sel: Selection | None) -> bool:
+    """Подходит ли запись журнала под выбор недель/классов/дат/вида (None — без ограничения)."""
+    if weeks and rec["week"] not in weeks:
+        return False
+    if sel:
+        if sel.classes is not None and rec.get("class") not in sel.classes:
+            return False
+        if sel.dates is not None and _dt.date.fromisoformat(rec["date"]) not in sel.dates:
+            return False
+        if sel.days is not None and _dt.date.fromisoformat(rec["date"]).weekday() not in sel.days:
+            return False
+        if sel.only and rec.get("kind", "oo") != sel.only:
+            return False
+    return True
+
+
+def undo(client: MeshClient, journal: Journal, weeks: list[int] | None = None,
+         sel: Selection | None = None, items: set[ItemKey] | None = None,
+         progress=None, should_stop: StopCheck | None = None, workers: int = 1) -> ApplyResult:
+    """Удаляет занятия из журнала (все, по выбору недель/классов/дат либо по ключам (вид, id));
+    удалённые записи убираются из журнала.  progress(done, total) — обратный вызов; should_stop()
+    и workers — как в :func:`apply_plan` (неудалённое остаётся в журнале)."""
+    res = ApplyResult()
+    records = journal.read()
+    todo = [rec for rec in records if journal_matches(rec, weeks, sel) and rec.get("item_id")
+            and (items is None or journal_key(rec) in items)]
+    gone: set[int] = set()      # id() удалённых записей
+    done = 0
+
+    def delete(rec: dict) -> None:
+        try:
+            if rec.get("kind") == "ec":
+                client.delete_ec_item(rec["item_id"])
+            else:
+                client.delete_item(rec["schedule_id"], rec["item_id"])
+        except MeshError as e:
+            if e.status != 404:         # 404 — уже нет, считаем удалённым
+                raise
+
+    def after(rec: dict, outcome) -> bool:
+        nonlocal done
+        if isinstance(outcome, MeshError):
+            res.errors.append((f"{'ВД ' if rec.get('kind') == 'ec' else ''}{rec['class']} {rec['date']} "
+                               f"урок {rec['lesson']} {rec['group_name']} (id {rec['item_id']})", outcome.message))
+        else:
+            res.deleted += 1
+            gone.add(id(rec))
+        done += 1
+        if progress:
+            progress(done, len(todo))
+        return bool(should_stop and should_stop())
+
+    if todo:
+        if should_stop and should_stop():
+            res.stopped = True
+        else:
+            res.stopped = run_parallel(delete, todo, workers, after)
+    journal.rewrite([rec for rec in records if id(rec) not in gone])
+    return res
+
+
+def copy_week(client: MeshClient, rd: RefData, from_week: int, to_weeks: list[int],
+              class_unit_ids: list[int], force: bool = False) -> list[str]:
+    """Копирование недели средствами МЭШ (POST .../copy) по каждому классу."""
+    out = []
+    sched = rd.schedule_by_week.get(from_week)
+    if not sched:
+        raise ValueError(f"в кэше нет недели {from_week}")
+    for cu_id in class_unit_ids:
+        cu = rd.class_unit_by_id[cu_id]
+        lvl = [cu["class_level_id"]]
+        chk = client.copy_check(sched["id"], lvl, cu_id, to_weeks)
+        busy = chk.get("busy_weeks") or []
+        if busy and not force:
+            out.append(f"{cu['name']}: на неделях {[b['week_number'] for b in busy]} уже есть занятия — пропущено (force=True, чтобы копировать поверх)")
+            continue
+        r = client.copy(sched["id"], lvl, cu_id, to_weeks)
+        out.append(f"{cu['name']}: {r.get('message', r)}")
+    return out

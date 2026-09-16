@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Данные школы и рабочие файлы инструмента — только локально
+/data/
+*.chngf
+!tests/data/*.chngf
+*.har
+/cache*/
+/logs/
+aupd_token.txt
+aupd_refresh_token.txt
+creds*.json
+mesh*.json
+mapping*.json
+*.journal.jsonl
+*.log
+
+# Сторонние материалы: дистрибутив ХроноГрафа, библиотека dnevnik_mos_ru
+/external/

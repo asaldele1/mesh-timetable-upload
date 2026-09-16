@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timetable-upload"
+dynamic = ["version"]
+description = "Перенос расписания из ХроноГраф 3.0 Мастер (.chngf) в МЭШ (school.mos.ru)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.25"]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+test = ["pytest"]
+
+[project.scripts]
+timetable-upload = "timetable_upload.cli:main"
+timetable-upload-gui = "timetable_upload.gui:main"
+
+[tool.setuptools]
+packages = ["timetable_upload", "timetable_upload.gui"]
+
+[tool.setuptools.dynamic]
+version = {attr = "timetable_upload.__version__"}
+
+[tool.setuptools.package-data]
+timetable_upload = ["defaults.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "E741", "B905"]   # длинные строки, имена вроде l (lesson), zip без strict
+
+[tool.ruff.lint.per-file-ignores]
+"timetable_upload/chngf.py" = ["E702"]   # «r.s(); r.s()» — пропуск полей бинарного формата с комментарием
