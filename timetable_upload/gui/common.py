@@ -194,14 +194,15 @@ def make_table(headers: list[str]) -> Table:
     return Table(headers)
 
 
+_FLAGS_RO = Qt.ItemIsSelectable | Qt.ItemIsEnabled          # флаги заранее: cell() зовётся десятками тысяч раз
+_FLAGS_EDIT = _FLAGS_RO | Qt.ItemIsEditable
+
+
 def cell(text, value=None, editable: bool = False, color: QColor | None = None, tip: str = "") -> QTableWidgetItem:
     it = QTableWidgetItem("" if text is None else str(text))
     if value is not None:
         it.setData(Qt.UserRole, value)
-    flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
-    if editable:
-        flags |= Qt.ItemIsEditable
-    it.setFlags(flags)
+    it.setFlags(_FLAGS_EDIT if editable else _FLAGS_RO)
     if color is not None:
         it.setBackground(QBrush(color))
         it.setForeground(QBrush(QColor("black")))

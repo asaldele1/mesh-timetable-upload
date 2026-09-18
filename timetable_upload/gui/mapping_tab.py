@@ -10,6 +10,7 @@ from collections.abc import Iterable
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QFormLayout,
     QGroupBox,
@@ -122,8 +123,10 @@ class EntityTab(QWidget):
         super().__init__()
         self.owner = owner
         self.ctx: Ctx | None = None
+        self.stale = False             # данные изменились, таблица ещё не перестроена (перестроится при показе)
         self._filling = False          # идёт программное изменение ячеек — itemChanged не обрабатывать
         self._bulk = False             # идёт заполнение таблицы целиком
+        self._row_color: dict[int, object] = {}   # цвет строк (None — обычный): чтобы не перекрашивать зря
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
         top = QHBoxLayout()
@@ -151,20 +154,42 @@ class EntityTab(QWidget):
         pass
 
     def fill(self, ctx: Ctx | None) -> None:
+        """Перестроить таблицу по ``ctx``.  Невидимая вкладка (другая вкладка окна или подвкладка) не
+        заполняется, а лишь помечается: таблица строится при показе — заполнение большой таблицы
+        занимает секунды и не должно замораживать окно, пока на неё никто не смотрит."""
         self.ctx = ctx
+        self.stale = True
+        if self.isVisible():
+            self._fill_now()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.stale:
+            self._fill_now()
+
+    def _fill_now(self) -> None:
+        ctx = self.ctx
+        self.stale = False
         vbar = self.table.verticalScrollBar().value()
         self._filling = self._bulk = True
         self.table.setUpdatesEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)       # большая таблица строится секунду-две
         try:
             self.table.setRowCount(0)
+            self._row_color = {}
             if ctx is not None:
                 self.fill_rows(ctx)
             self.table.fit_columns()
         finally:
+            QApplication.restoreOverrideCursor()
             self.table.setUpdatesEnabled(True)
             self._filling = self._bulk = False
         self.table.verticalScrollBar().setValue(vbar)
         self.apply_filter()
+        self.filled()
+
+    def filled(self) -> None:
+        """Вызывается после (возможно, отложенного) заполнения таблицы."""
 
     def fill_rows(self, ctx: Ctx) -> None:
         raise NotImplementedError
@@ -193,7 +218,9 @@ class EntityTab(QWidget):
         it = self.table.item(row, col)
         it.setText(text)
         it.setToolTip(text)
-        paint_row(self.table, row, color)
+        if self._row_color.get(row) is not None or color is not None:    # новые строки без цвета не красим
+            paint_row(self.table, row, color)
+            self._row_color[row] = color
         if not self._bulk:                    # при заполнении высоту всех строк подгонит fit_columns
             self.table.resizeRowToContents(row)
 
@@ -491,12 +518,12 @@ class GroupsTab(EntityTab):
                "Задано вручную (двойной щелчок)", "Как выбрана"]
     problem_col = 7
     COL_CLS, COL_SUBJ, COL_GRP, COL_PRIO, COL_TEACHER, COL_N, COL_HOURS, COL_STATUS, COL_MESH, COL_MANUAL, COL_WHY = range(11)
+    stats: Counter = Counter()                 # ok / weak / over / bad / ec по строкам (после заполнения)
 
     def fill_rows(self, ctx: Ctx):
-        lessons = relevant_lessons(ctx.tt, ctx.m)
         seen: dict[str, chngf.Lesson] = {}
         per_week: Counter = Counter()          # (ключ, неделя цикла) → уроков
-        for l in lessons:
+        for l in relevant_lessons(ctx.tt, ctx.m):
             key = group_key(l)
             seen.setdefault(key, l)
             per_week[(key, l.week)] += 1
@@ -524,6 +551,9 @@ class GroupsTab(EntityTab):
 
     def prio_at(self, row: int) -> int:
         return self.table.item(row, self.COL_PRIO).data(Qt.UserRole)
+
+    def filled(self) -> None:
+        self.owner.update_summary()          # сводка считается по строкам этой таблицы
 
     def refresh_rows(self, rows: Iterable[int]) -> list[int]:
         """Заново выбрать группу МЭШ в строках ``rows``, переписав только изменившиеся ячейки
@@ -826,8 +856,6 @@ class MappingTab(QWidget):
                         (self.rooms, "Кабинеты"), (self.groups, "Группы"), (self.settings, "Настройки")):
             self.tabs.addTab(w, name)
         lay.addWidget(self.tabs, 1)
-        self._groups_stale = False
-        self.tabs.currentChanged.connect(self._tab_changed)
         self.state.changed.connect(self._on_changed)
         self.refresh()
 
@@ -844,8 +872,7 @@ class MappingTab(QWidget):
         ok, why = st.ready()
         ctx = Ctx(st.tt, st.rd, st.m) if ok else None
         for tab in (self.classes, self.subjects, self.teachers, self.rooms, self.groups):
-            tab.fill(ctx)
-        self._groups_stale = False
+            tab.fill(ctx)              # невидимые вкладки заполнятся при показе
         self.settings.fill(st.m)
         self._gate()
         self.update_summary(why)
@@ -872,18 +899,20 @@ class MappingTab(QWidget):
         m = st.m
         cls_all = [c.name for c in st.tt.classes if c.name not in m.ignore_classes]
         subj_all = [s for s in ctx.subject_count if s not in m.ignore_subjects]
-        used_teachers = {l.teacher for l in relevant_lessons(st.tt, m) if l.teacher}
-        used_rooms = {l.cabinet for l in relevant_lessons(st.tt, m) if l.cabinet}
+        relevant = relevant_lessons(st.tt, m)          # ctx.relevant устаревает при правках флажков
+        used_teachers = {l.teacher for l in relevant if l.teacher}
+        used_rooms = {l.cabinet for l in relevant if l.cabinet}
         gs = self.groups.stats
+        groups = ("группы: пересчёт при открытии вкладки «Группы»" if self.groups.stale else
+                  f"группы {gs['ok'] + gs['weak'] + gs['over']}/{gs['ok'] + gs['weak'] + gs['over'] + gs['bad']} (ВД {gs['ec']}, проверить {gs['weak']}"
+                  + (f", уроков больше часов {gs['over']}" if gs['over'] else "") + ")")
         self.summary.setText(
             f"классы {sum(1 for c in cls_all if m.classes.get(c) and st.rd.class_unit(m.classes[c]))}/{len(cls_all)} · "
             f"предметы {sum(1 for s in subj_all if m.subjects.get(s))}/{len(subj_all)} · "
             f"учителя {sum(1 for t in used_teachers if m.teachers.get(t) in st.rd.teacher_by_id and not st.rd.teacher_deleted(m.teachers.get(t)))}"
             f"/{len(used_teachers)} · "
             f"кабинеты {sum(1 for r in used_rooms if m.rooms.get(r) in st.rd.room_by_id)}/{len(used_rooms)} · "
-            f"группы {gs['ok'] + gs['weak'] + gs['over']}/{gs['ok'] + gs['weak'] + gs['over'] + gs['bad']} (ВД {gs['ec']}, проверить {gs['weak']}"
-            + (f", уроков больше часов {gs['over']}" if gs['over'] else "") + ")"
-            + ("   — есть несохранённые изменения" if st.mapping_dirty else ""))
+            + groups + ("   — есть несохранённые изменения" if st.mapping_dirty else ""))
 
     def mapping_edited(self, reindex: bool = False, groups_stale: bool = True):
         st = self.state
@@ -893,15 +922,11 @@ class MappingTab(QWidget):
             self.refresh()
             return
         # выбор групп зависит от классов, предметов и учителей — вкладку «Группы» перестроим при её открытии
-        self._groups_stale = self._groups_stale or groups_stale
+        # (она сейчас не видна: правка пришла с другой вкладки)
+        if groups_stale:
+            self.groups.fill(self.groups.ctx)      # видна — перестроится сейчас, иначе при показе
         self.update_summary()
         self.app.update_title()
-
-    def _tab_changed(self, index: int):
-        if self.tabs.widget(index) is self.groups and self._groups_stale and self.groups.ctx is not None:
-            self._groups_stale = False
-            self.groups.fill(self.groups.ctx)
-            self.update_summary()
 
     def save(self):
         try:
