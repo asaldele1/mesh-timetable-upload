@@ -36,7 +36,8 @@ class AppState(QObject):
     """Всё, что разделяют вкладки: пути, файл расписания, кэш справочников, сопоставление.
 
     Сигнал ``changed(what)`` — 'file' | 'refdata' | 'mapping' (загружено другое сопоставление) |
-    'mapping_edited' (правка в памяти) | 'mapping_saved' | 'session' | 'paths' | 'journal'."""
+    'mapping_edited' (правка в памяти) | 'mapping_saved' | 'session' | 'paths' | 'journal' |
+    'refreshing' (началось/закончилось обновление справочников с сервера)."""
     changed = Signal(str)
 
     def __init__(self):
@@ -50,6 +51,11 @@ class AppState(QObject):
         self.client: MeshClient | None = None
         self.session_text = ""
         self.session_short = ""
+        # обновление справочников с сервера (см. MainWindow.start_refresh): пока идёт, части, которым
+        # нужен список групп, недоступны; refresh_gen растёт при смене входа — результат старого входа не берём
+        self.refreshing = False
+        self.refresh_error = ""
+        self.refresh_gen = 0
 
     # ------------------------------------------------------------------ настройки
     @property
@@ -97,6 +103,20 @@ class AppState(QObject):
             log.info("кэш %s: %s", cache, self.rd.summary())
         self.changed.emit("refdata")
         return self.rd
+
+    def set_refdata(self, rd: refdata.RefData) -> None:
+        """Подменить справочники свежезагруженными (они уже записаны в кэш)."""
+        rd._index(self.m.ec_course_suffix)
+        self.rd = rd
+        self.refresh_error = ""
+        log.info("справочники обновлены с сервера: %s", rd.summary())
+        self.changed.emit("refdata")
+
+    def set_refreshing(self, on: bool, error: str = "") -> None:
+        self.refreshing = on
+        if error:
+            self.refresh_error = error
+        self.changed.emit("refreshing")
 
     def load_mapping(self) -> Mapping:
         self.m = Mapping.load(self.paths["mapping"])
@@ -154,7 +174,9 @@ class AppState(QObject):
         return client
 
     def forget_client(self) -> None:
+        """Сменились токен/профиль/год: клиент заново, идущее обновление справочников — не в счёт."""
         self.client, self.session_text, self.session_short = None, "", ""
+        self.refresh_gen += 1
 
     # ------------------------------------------------------------------ производные
     def week1_monday(self) -> _dt.date:
@@ -166,5 +188,7 @@ class AppState(QObject):
         if self.tt is None:
             return False, "не загружен файл .chngf (вкладка «Данные и вход»)"
         if self.rd is None:
+            if self.refreshing:
+                return False, "справочники МЭШ ещё загружаются с сервера — подождите"
             return False, "нет кэша справочников МЭШ — загрузите их (вкладка «Данные и вход»)"
         return True, ""

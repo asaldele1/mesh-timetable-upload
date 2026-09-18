@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import auth, paths, refdata
+from .. import auth, paths
 from ..mesh_api import fmt_roles
 from .common import error, info, scrollable
 
@@ -136,8 +136,8 @@ class SetupTab(QWidget):
         form.addRow("Вход:", row)
         row = QHBoxLayout()
         b = QPushButton("Загрузить справочники из МЭШ (только чтение)")
-        b.setToolTip("Классы, группы, учителя, кабинеты, звонки, недели, ВД — в кэш на диске; "
-                     "повторять после изменений в МЭШ и при смене учебного года")
+        b.setToolTip("Классы, группы, учителя, кабинеты, звонки, недели, ВД — в кэш на диске. Загружаются сами "
+                     "при каждом запуске и после входа; кнопка — чтобы повторить после изменений в МЭШ")
         b.clicked.connect(self.fetch_refdata)
         row.addWidget(b)
         self.cache_label = QLabel("")
@@ -163,10 +163,17 @@ class SetupTab(QWidget):
     def _on_changed(self, what: str):
         if what == "file":
             self.file_info.setPlainText(file_info_text(self.state.tt) if self.state.tt else "файл не загружен")
-        elif what == "refdata":
-            rd = self.state.rd
-            self.cache_label.setText(("в кэше: " + rd.summary()) if rd else
-                                     "кэш пуст — загрузите справочники (классы, группы, учителя, кабинеты, звонки, недели, ВД)")
+        elif what in ("refdata", "refreshing"):
+            st = self.state
+            rd = st.rd
+            if st.refreshing:
+                text = "загружаются с сервера…" + (f" (пока используется кэш: {rd.summary()})" if rd else "")
+            else:
+                text = ("в кэше: " + rd.summary()) if rd else \
+                    "кэш пуст — войдите в МЭШ: справочники (классы, группы, учителя, кабинеты, звонки, недели, ВД) загрузятся сами"
+                if st.refresh_error:
+                    text += f"\nОбновить с сервера не удалось: {st.refresh_error}"
+            self.cache_label.setText(text)
         elif what in ("session", "paths"):
             self.auth_label.setText(self._auth_text())
 
@@ -228,24 +235,12 @@ class SetupTab(QWidget):
         def done(text):
             st.changed.emit("session")      # обработчик ставит краткий текст — подробный поверх него
             self.auth_label.setText(text)
+            self.app.start_refresh()        # вход (возможно, другой) — справочники с сервера заново
 
         self.app.run(job, done, "Проверка входа")
 
     def fetch_refdata(self):
-        st = self.state
-        cache = st.paths["cache"] or "cache"
-
-        def job(progress, message):
-            client = st.get_client()
-            message("загрузка справочников…")
-            return refdata.fetch(client, cache, None)
-
-        def done(rd):
-            st.changed.emit("session")
-            self.load_refdata()
-            info(self, "Справочники", "Загружено: " + rd.summary())
-
-        self.app.run(job, done, "Загрузка справочников")
+        self.app.start_refresh(manual=True)
 
 
 class AdvancedDialog(QDialog):

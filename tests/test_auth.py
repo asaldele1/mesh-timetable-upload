@@ -172,3 +172,34 @@ def test_retry_on_429_is_logged(monkeypatch, caplog):
     with pytest.raises(MeshError) as e:
         client.get("/x")
     assert e.value.status == 429 and pauses == [2.0, 4.0, 2.0, 4.0, 6.0]
+
+
+def test_get_pages_parallel_and_fallback():
+    """Первая страница даёт Pages в заголовках — остальные запрашиваются сразу (параллельно) и
+    склеиваются по порядку; без заголовка — страница за страницей, пока не придёт неполная."""
+    from timetable_upload.mesh_api import MeshClient
+
+    class Fake(MeshClient):
+        def __init__(self, items, per_page, headers=True):
+            super().__init__("t")
+            self.items, self.pp, self.hdr, self.calls = items, per_page, headers, []
+
+        def request(self, method, path, params=None, json_body=None, _retry_auth=True, with_headers=False):
+            page = params["page"]
+            self.calls.append(page)
+            chunk = self.items[(page - 1) * self.pp: page * self.pp]
+            pages = -(-len(self.items) // self.pp)
+            h = {"Page": str(page), "Pages": str(pages), "PageSize": str(self.pp)} if self.hdr else {}
+            return (chunk, h) if with_headers else chunk
+
+    items = list(range(1, 701))
+    c = Fake(items, 300)
+    assert c.get_pages("/x", per_page=300) == items and sorted(c.calls) == [1, 2, 3]
+    c = Fake(items[:300], 300)                       # ровно одна страница
+    assert c.get_pages("/x", per_page=300) == items[:300] and c.calls == [1]
+    c = Fake([], 300)
+    assert c.get_pages("/x", per_page=300) == [] and c.calls == [1]
+    c = Fake(items, 300, headers=False)              # заголовков нет — последовательно
+    assert c.get_pages("/x", per_page=300) == items and c.calls == [1, 2, 3]
+    c = Fake(items[:600], 300, headers=False)        # последняя страница полная — ещё один пустой запрос
+    assert c.get_pages("/x", per_page=300) == items[:600] and c.calls == [1, 2, 3]

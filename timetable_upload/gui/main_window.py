@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .common import LogHandler, Worker, error
+from .. import refdata
+from .common import LogHandler, Worker, error, info
 from .mapping_tab import MappingTab
 from .setup_tab import SetupTab
 from .state import AppState
@@ -46,6 +47,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.state = AppState()
         self.worker: Worker | None = None
+        self.refresh_worker: Worker | None = None   # обновление справочников — отдельно, окно не блокирует
+        self._refresh_again = False
+        self._pending_rd: refdata.RefData | None = None
         # стартовый размер — не больше рабочей области экрана (ноутбуки с 768 px по высоте)
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1400, screen.width() - 40), min(900, screen.height() - 80))
@@ -73,6 +77,8 @@ class MainWindow(QMainWindow):
         # строка состояния
         self.status_label = QLabel("")
         self.statusBar().addWidget(self.status_label, 1)
+        self.refresh_label = QLabel("")
+        self.statusBar().addPermanentWidget(self.refresh_label)
         self.task_label = QLabel("")
         self.statusBar().addPermanentWidget(self.task_label)
         self.task_progress = QProgressBar()
@@ -100,6 +106,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
         self.state.changed.connect(lambda what: self.update_title())
         self.update_title()
+        # справочники — с сервера при каждом запуске (в фоне; без входа — остаётся кэш, сообщение в журнале)
+        QTimer.singleShot(0, self.start_refresh)
 
     def _initial_load(self):
         st = self.state
@@ -156,6 +164,9 @@ class MainWindow(QMainWindow):
             self.task_label.setText("")
             self.task_progress.setVisible(False)
             self.stop_btn.setVisible(False)
+            if self._pending_rd is not None:      # справочники пришли, пока шла задача, — подменяем теперь
+                rd, self._pending_rd = self._pending_rd, None
+                self.state.set_refdata(rd)
             self.update_title()
 
         def ok(result):
@@ -196,11 +207,72 @@ class MainWindow(QMainWindow):
         w = self.worker
         return w is not None and w.cancel.is_set()
 
+    # ------------------------------------------------------------------ справочники с сервера
+    def start_refresh(self, manual: bool = False):
+        """Перезагрузить справочники с сервера в фоне, не блокируя окно: пока идёт, недоступны только
+        части, которым нужен список групп (сопоставление предметов и групп, план, загрузка), остальное
+        работает по прежнему кэшу.  Сменился вход, пока шла загрузка (refresh_gen), — результат отбрасывается
+        и загрузка повторяется.  manual — по кнопке: об ошибке сообщаем окном, иначе — только в журнале."""
+        st = self.state
+        if self.refresh_worker is not None and self.refresh_worker.isRunning():
+            self._refresh_again = True
+            return
+        cache = st.paths["cache"] or "cache"
+        gen = st.refresh_gen
+
+        def job(progress, message):
+            client = st.get_client()
+            return refdata.fetch(client, cache, None, message)
+
+        w = Worker(job, self)
+        self.refresh_worker = w
+        st.set_refreshing(True)
+        self.refresh_label.setText("справочники: загрузка с сервера…")
+        log.info("обновление справочников с сервера: начало")
+
+        def ok(rd):
+            if gen != st.refresh_gen:
+                log.info("справочники загружены для прежнего входа — отброшены, загружаем заново")
+                self._refresh_again = True
+                return
+            if self.worker is not None and self.worker.isRunning():
+                self._pending_rd = rd            # идёт другая задача со старыми справочниками — подменим после неё
+            else:
+                st.set_refdata(rd)
+            st.changed.emit("session")
+            if manual:
+                info(self, "Справочники", "Загружено: " + rd.summary())
+
+        def failed(msg):
+            log.error("обновление справочников: %s", msg)
+            st.refresh_error = msg
+            if manual:
+                error(self, "Загрузка справочников", msg)
+
+        def thread_done():
+            again, self._refresh_again = self._refresh_again or gen != st.refresh_gen, False
+            self.refresh_label.setText("")
+            if again:
+                self.start_refresh()
+            else:
+                st.set_refreshing(False)
+
+        w.done.connect(ok)
+        w.failed.connect(failed)
+        w.message.connect(lambda t: self.refresh_label.setText(f"справочники: {t}"))
+        w.finished.connect(thread_done)          # после done/failed: поток действительно завершён
+        w.start()
+
     def closeEvent(self, event: QCloseEvent):
         if self.worker is not None and self.worker.isRunning():
             QMessageBox.warning(self, "Задача выполняется", "Дождитесь завершения текущей задачи или нажмите «Остановить».")
             event.ignore()
             return
+        if self.refresh_worker is not None and self.refresh_worker.isRunning():
+            # прервать запрос нельзя — дожидаемся (несколько секунд), иначе поток убьётся вместе с окном
+            QApplication.setOverrideCursor(Qt.BusyCursor)
+            self.refresh_worker.wait(60000)
+            QApplication.restoreOverrideCursor()
         if self.state.mapping_dirty:
             r = QMessageBox.question(self, "Несохранённое сопоставление", "Сохранить изменения сопоставления перед выходом?",
                                      QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save)

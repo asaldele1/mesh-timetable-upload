@@ -65,7 +65,7 @@ class UploadTab(QWidget):
         b = QPushButton("Снять все")
         b.clicked.connect(lambda: self._check_weeks(False))
         row.addWidget(b)
-        b = QPushButton("Посчитать занятия на сервере")
+        self.count_btn = b = QPushButton("Посчитать занятия на сервере")
         b.setToolTip("Для отмеченных недель (или всех, если ничего не отмечено) запросить у сервера число уроков и занятий ВД")
         b.clicked.connect(self.count_on_server)
         row.addWidget(b)
@@ -190,6 +190,19 @@ class UploadTab(QWidget):
             self._classes_changed()
         if what in ("file", "refdata", "mapping", "mapping_edited"):
             self.invalidate()
+        if what in ("refdata", "refreshing"):
+            self._gate()
+
+    def _gate(self):
+        """Пока справочники обновляются с сервера, план и загрузка недоступны: они опираются на группы,
+        недели и звонки, а работать по старому кэшу здесь нельзя."""
+        busy = self.state.refreshing
+        for b in (self.plan_btn, self.compare_btn, self.count_btn):
+            b.setEnabled(not busy)
+        if busy:
+            self.apply_btn.setEnabled(False)
+        self.summary.setText("Справочники обновляются с сервера — план можно построить после загрузки." if busy
+                             else (self.summary.text() if self.plans else "План не построен."))
 
     def fill_weeks(self):
         st = self.state
@@ -339,6 +352,8 @@ class UploadTab(QWidget):
     def build(self, online: bool):
         st = self.state
         ok, why = st.ready()
+        if st.refreshing:
+            ok, why = False, "справочники обновляются с сервера — подождите"
         if not ok:
             error(self, "План", why)
             return
@@ -462,8 +477,9 @@ class UploadTab(QWidget):
     # ------------------------------------------------------------------ загрузка
     def apply(self):
         st = self.state
-        if not self.plans or not self.plans_online:
-            error(self, "Загрузка", "Сначала выполните «Сравнить с сервером».")
+        if not self.plans or not self.plans_online or st.refreshing:
+            error(self, "Загрузка", "Сначала выполните «Сравнить с сервером»." if not st.refreshing
+                  else "Справочники обновляются с сервера — сравните с сервером заново после загрузки.")
             return
         n_create = sum(len(p.to_create) for p in self.plans)
         n_delete = sum(len(p.to_delete) for p in self.plans)

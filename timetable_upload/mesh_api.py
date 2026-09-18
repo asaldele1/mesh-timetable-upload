@@ -19,6 +19,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -57,6 +58,7 @@ class Session:
 
 
 MAX_WORKERS = 16     # верхняя граница числа параллельных запросов (размер пула соединений)
+PAGE_WORKERS = 8     # параллельных страниц в get_pages (вместе с FETCH_WORKERS refdata не больше пула)
 
 
 def fmt_roles(roles: Any) -> str:
@@ -105,9 +107,10 @@ class MeshClient:
 
     # ------------------------------------------------------------------ низкий уровень
     def request(self, method: str, path: str, params: dict | None = None, json_body: Any = None,
-                _retry_auth: bool = True) -> Any:
+                _retry_auth: bool = True, with_headers: bool = False) -> Any:
         """json_body — данные либо функция без аргументов, которая их строит: она вызывается заново при
-        повторе после обновления токена (тело может зависеть от токена, см. :meth:`sessions`)."""
+        повторе после обновления токена (тело может зависеть от токена, см. :meth:`sessions`).
+        with_headers — вернуть пару (данные, заголовки ответа): в заголовках сервер отдаёт пагинацию."""
         url = self.base_url + path
         body = json_body() if callable(json_body) else json_body
         token_used = self.token
@@ -128,7 +131,7 @@ class MeshClient:
                 if self.token == token_used:        # иначе другой поток уже обновил
                     log.info("сервер ответил 401 — обновляем токен и повторяем запрос")
                     self.set_token(self.refresh())
-            return self.request(method, path, params, json_body, _retry_auth=False)
+            return self.request(method, path, params, json_body, _retry_auth=False, with_headers=with_headers)
         if resp.status_code >= 400:
             try:
                 payload = resp.json()
@@ -137,11 +140,13 @@ class MeshClient:
             msg = payload.get("message") if isinstance(payload, dict) else str(payload)[:500]
             raise MeshError(resp.status_code, msg or resp.reason, payload)
         if not resp.content:
-            return None
-        try:
-            return resp.json()
-        except ValueError:
-            return resp.text
+            data = None
+        else:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = resp.text
+        return (data, resp.headers) if with_headers else data
 
     def _pause(self) -> None:
         """Выдержать ``delay`` после предыдущего запроса (любого потока)."""
@@ -163,9 +168,38 @@ class MeshClient:
         return self.request("DELETE", path)
 
     def get_paged(self, path: str, per_page: int = 1000, **params) -> list:
-        """Постраничная выборка (page/per_page); сервер отдаёт не более 1000 записей за раз."""
+        """Постраничная выборка (page/per_page) страница за страницей; сервер отдаёт не более 1000
+        записей за раз.  Для больших списков — :meth:`get_pages` (страницы параллельно)."""
         out: list = []
         page = 1
+        while True:
+            chunk = self.get(path, page=page, per_page=per_page, **params) or []
+            out.extend(chunk)
+            if len(chunk) < per_page:
+                return out
+            page += 1
+
+    def get_pages(self, path: str, per_page: int = 300, **params) -> list:
+        """Постраничная выборка, где остальные страницы запрашиваются параллельно: первая страница
+        приходит с заголовками ``Page``/``Pages``/``PageSize``, по ``Pages`` остальные берутся сразу
+        все (страница групп грузится больше секунды).  Без заголовка — страница за страницей."""
+        first, headers = self.request("GET", path, params={**params, "page": 1, "per_page": per_page}, with_headers=True)
+        first = first or []
+        try:
+            pages = int(headers.get("Pages") or 0)
+        except ValueError:
+            pages = 0
+        if not headers.get("Pages"):
+            return first + (self._paged_from(path, 2, per_page, **params) if len(first) >= per_page else [])
+        if pages <= 1:
+            return first
+        rest = range(2, pages + 1)
+        with ThreadPoolExecutor(max_workers=min(len(rest), PAGE_WORKERS)) as ex:
+            chunks = list(ex.map(lambda p: self.get(path, page=p, per_page=per_page, **params) or [], rest))
+        return first + [x for chunk in chunks for x in chunk]
+
+    def _paged_from(self, path: str, page: int, per_page: int, **params) -> list:
+        out: list = []
         while True:
             chunk = self.get(path, page=page, per_page=per_page, **params) or []
             out.extend(chunk)
@@ -245,7 +279,7 @@ class MeshClient:
         params = {"academic_year_id": self.ay, "with_deleted": "true"}
         if class_level_id is not None:
             params["class_level_id"] = class_level_id
-        return self.get_paged(f"{CORE}/teacher_profiles", per_page=300, **params)
+        return self.get_pages(f"{CORE}/teacher_profiles", per_page=300, **params)
 
     def bells_timetable_assignments(self, class_unit_ids: Iterable[int] | None = None) -> list:
         params = {"academic_year_id": self.ay}
@@ -264,7 +298,7 @@ class MeshClient:
                   "with_student_ids": "true", "with_incompatible_groups": "true"}
         if class_level_id is not None:
             params["class_level_id"] = class_level_id
-        return self.get_paged(f"{PLAN}/groups", per_page=1000, **params)
+        return self.get_pages(f"{PLAN}/groups", per_page=300, **params)
 
     # ------------------------------------------------------------------ расписание
     def schedules(self) -> list:

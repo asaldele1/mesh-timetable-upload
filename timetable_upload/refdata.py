@@ -1,7 +1,8 @@
 """Справочные данные МЭШ (классы, группы, учителя, кабинеты, звонки, недели).
 
-Загружаются через API (:func:`fetch`) в каталог-кэш в виде JSON-файлов, чтобы
-не дёргать сервер при каждом запуске.
+Загружаются через API (:func:`fetch`) в каталог-кэш в виде JSON-файлов: с ними можно
+работать без входа (разбор, сопоставление, план), а графический интерфейс при каждом
+запуске перезагружает их с сервера — id недель ВД, учителя групп и составы меняются.
 """
 
 from __future__ import annotations
@@ -10,9 +11,13 @@ import datetime as _dt
 import json
 import os
 import re
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from .mesh_api import MeshClient
+
+FETCH_WORKERS = 6        # параллельных запросов при загрузке справочников (плюс страницы групп внутри)
 
 FILES = ("schedules", "groups", "class_units", "rooms", "teacher_profiles",
          "bells_timetable_assignments", "bells_timetables", "class_levels", "academic_year",
@@ -72,6 +77,7 @@ class RefData:
     ec_activities: list = field(default_factory=list)   # курсы внеурочной деятельности
     ec_groups: list = field(default_factory=list)       # группы ВД (как отдаёт сервер)
     ec_schedules: list = field(default_factory=list)    # расписания ВД по неделям
+    fetched_at: _dt.datetime | None = None              # когда загружено с сервера (по времени файлов кэша)
 
     # ------------------------------------------------------------------ загрузка/сохранение
     @classmethod
@@ -83,6 +89,9 @@ class RefData:
             if os.path.exists(p):
                 with open(p, encoding="utf-8") as f:
                     setattr(rd, name, json.load(f))
+        p = os.path.join(cache_dir, "groups.json")
+        if os.path.exists(p):
+            rd.fetched_at = _dt.datetime.fromtimestamp(os.path.getmtime(p))
         rd._index(ec_course_suffix)
         return rd
 
@@ -94,7 +103,8 @@ class RefData:
 
     def summary(self) -> str:
         ay = self.academic_year
-        return (f"учебный год {ay.get('name', '?')} (id {ay.get('id', '?')}): "
+        return ((f"загружено {self.fetched_at:%d.%m.%Y %H:%M}; " if self.fetched_at else "")
+                + f"учебный год {ay.get('name', '?')} (id {ay.get('id', '?')}): "
                 f"недель: {len(self.schedules)}, групп: {len(self.groups)}, классов: {len(self.class_units)}, "
                 f"кабинетов: {len(self.rooms)}, учителей: {len(self.teachers)}"
                 f"{f' (+ удалённых {len(self.teacher_profiles) - len(self.teachers)})' if len(self.teachers) < len(self.teacher_profiles) else ''}, "
@@ -229,37 +239,37 @@ class RefData:
 
 
 # ---------------------------------------------------------------------- получение через API
-def fetch(client: MeshClient, cache_dir, class_level_ids: list[int] | None = None) -> RefData:
+def fetch(client: MeshClient, cache_dir, class_level_ids: list[int] | None = None,
+          message: Callable[[str], None] | None = None) -> RefData:
+    """Все справочники с сервера — в кэш на диске.  Списки независимы и запрашиваются параллельно
+    (группы — самый долгий, их страницы тоже идут параллельно, см. ``MeshClient.get_pages``);
+    в кэш попадает только полный набор: при ошибке любого запроса старый кэш остаётся."""
     rd = RefData()
     rd.academic_year = client.session_info.academic_year
-    rd.schedules = client.schedules()
-    rd.class_levels = client.class_levels()
-    rd.rooms = client.rooms()
-    if class_level_ids:
-        seen: dict[int, dict] = {}
-        for lvl in class_level_ids:
-            for g in client.groups(class_level_id=lvl):
-                seen[g["id"]] = g
-        rd.groups = list(seen.values())
-        seen = {}
-        for lvl in class_level_ids:
-            for c in client.class_units(class_level_id=lvl):
-                seen[c["id"]] = c
-        rd.class_units = list(seen.values())
-        seen = {}
-        for lvl in class_level_ids:
-            for t in client.teacher_profiles(class_level_id=lvl):
-                seen[t["id"]] = t
-        rd.teacher_profiles = list(seen.values())
-    else:
-        rd.groups = client.groups()
-        rd.class_units = client.class_units()
-        rd.teacher_profiles = client.teacher_profiles()
-    rd.bells_timetable_assignments = client.bells_timetable_assignments()
-    rd.bells_timetables = client.bells_timetables()
-    rd.ec_activities = client.ec_activities()
-    rd.ec_groups = client.ec_groups()
-    rd.ec_schedules = client.ec_schedules()
+
+    def by_levels(fn):
+        def run():
+            seen: dict[int, dict] = {}
+            for lvl in class_level_ids:
+                for x in fn(class_level_id=lvl):
+                    seen[x["id"]] = x
+            return list(seen.values())
+        return run if class_level_ids else fn
+
+    tasks: dict[str, Callable[[], list]] = {
+        "schedules": client.schedules, "class_levels": client.class_levels, "rooms": client.rooms,
+        "groups": by_levels(client.groups), "class_units": by_levels(client.class_units),
+        "teacher_profiles": by_levels(client.teacher_profiles),
+        "bells_timetable_assignments": client.bells_timetable_assignments, "bells_timetables": client.bells_timetables,
+        "ec_activities": client.ec_activities, "ec_groups": client.ec_groups, "ec_schedules": client.ec_schedules,
+    }
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+        futures = {name: ex.submit(fn) for name, fn in tasks.items()}
+        for name, f in futures.items():
+            setattr(rd, name, f.result())
+            if message:
+                message(f"получено: {name}")
+    rd.fetched_at = _dt.datetime.now()
     rd.save(cache_dir)
     rd._index()
     return rd

@@ -836,6 +836,8 @@ class MappingTab(QWidget):
             self.refresh()
         elif what == "mapping_saved":
             self.update_summary()
+        elif what == "refreshing":
+            self._gate()
 
     def refresh(self):
         st = self.state
@@ -845,8 +847,21 @@ class MappingTab(QWidget):
             tab.fill(ctx)
         self._groups_stale = False
         self.settings.fill(st.m)
-        self.auto_btn.setEnabled(ok)
+        self._gate()
         self.update_summary(why)
+
+    def _gate(self):
+        """Пока справочники обновляются с сервера, то, что зависит от списка групп (предметы, группы,
+        автосопоставление), недоступно; классы, учителя, кабинеты и настройки работают по прежнему кэшу."""
+        st = self.state
+        ok, _ = st.ready()
+        busy = st.refreshing
+        self.auto_btn.setEnabled(ok and not busy)
+        self.auto_btn.setToolTip("справочники обновляются с сервера — подождите" if busy else "")
+        for tab in (self.subjects, self.groups):
+            i = self.tabs.indexOf(tab)
+            self.tabs.setTabEnabled(i, not busy)
+            self.tabs.setTabToolTip(i, "справочники обновляются с сервера — подождите" if busy else "")
 
     def update_summary(self, why: str = ""):
         st = self.state

@@ -209,14 +209,29 @@ def _load_all(args):
     return tt, rd, m
 
 
+def _fresh_refdata(args, client, m: Mapping, rd: refdata.RefData) -> refdata.RefData:
+    """Перед работой с сервером — свежие справочники (как делает GUI при запуске): id недель ВД,
+    учителя и составы групп меняются, а старый кэш ведёт к «висящим» занятиям.  --no-refresh — по кэшу."""
+    if getattr(args, "no_refresh", False):
+        rd.check_academic_year(client)
+        return rd
+    print("Обновление справочников с сервера…", end="", flush=True)
+    rd = refdata.fetch(client, args.cache, None)
+    rd._index(m.ec_course_suffix)
+    print(" готово:", rd.summary())
+    return rd
+
+
 def _print_plan(plan: uploader.Plan, verbose: bool):
     print(export.plan_text(plan, verbose))
 
 
 def cmd_plan(args):
     tt, rd, m = _load_all(args)
+    client = make_client(args) if args.online else None
+    if client:
+        rd = _fresh_refdata(args, client, m, rd)
     w1 = week1(args, tt, rd)
-    client = make_client(args, rd) if args.online else None
     sel = selection(args, tt)
     plans = []
     for week in weeks_for(args, sel, w1):
@@ -230,8 +245,9 @@ def cmd_plan(args):
 
 def cmd_upload(args):
     tt, rd, m = _load_all(args)
+    client = make_client(args)
+    rd = _fresh_refdata(args, client, m, rd)
     w1 = week1(args, tt, rd)
-    client = make_client(args, rd)
     journal = Journal(args.journal)
     total_err = 0
     sel = selection(args, tt)
@@ -400,6 +416,8 @@ def build_parser() -> argparse.ArgumentParser:
         selection(p)
         p.add_argument("--week1-monday", help="понедельник 1-й учебной недели (ГГГГ-ММ-ДД); по умолчанию — по дате начала учебного года")
         p.add_argument("--replace", action="store_true", help="удалять на сервере занятия наших классов, которых нет в файле")
+        p.add_argument("--no-refresh", action="store_true",
+                       help="при работе с сервером не перезагружать справочники, а взять кэш как есть")
         auth(p)
 
     p = sub.add_parser("plan", help="показать, что будет создано (с --online — и сравнить с сервером)")
