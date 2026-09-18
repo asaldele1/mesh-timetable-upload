@@ -10,7 +10,6 @@ from collections.abc import Iterable
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QFormLayout,
     QGroupBox,
@@ -30,16 +29,17 @@ from .common import (
     COLOR_BAD,
     COLOR_OFF,
     COLOR_WARN,
+    Cell,
     CheckListDialog,
     ChoiceDelegate,
     PickDialog,
+    RowModel,
+    TableView,
     cell,
-    check_cell,
     error,
     filter_rows,
     info,
     make_table,
-    paint_row,
     scrollable,
 )
 
@@ -115,18 +115,17 @@ def _natural(s: str):
 
 # ---------------------------------------------------------------------- базовая таблица
 class EntityTab(QWidget):
-    """Таблица сущностей с фильтром по тексту и переключателем «только проблемы»."""
+    """Таблица сущностей (RowModel + TableView) с фильтром по тексту и переключателем «только проблемы»."""
     headers: list[str] = []
     problem_col: int | None = None
+    editable_cols: tuple[int, ...] = ()
+    check_cols: tuple[int, ...] = ()
 
     def __init__(self, owner: MappingTab):
         super().__init__()
         self.owner = owner
         self.ctx: Ctx | None = None
         self.stale = False             # данные изменились, таблица ещё не перестроена (перестроится при показе)
-        self._filling = False          # идёт программное изменение ячеек — itemChanged не обрабатывать
-        self._bulk = False             # идёт заполнение таблицы целиком
-        self._row_color: dict[int, object] = {}   # цвет строк (None — обычный): чтобы не перекрашивать зря
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
         top = QHBoxLayout()
@@ -141,9 +140,10 @@ class EntityTab(QWidget):
         top.addWidget(self.count_label)
         self.extra_controls(top)
         lay.addLayout(top)
-        self.table = make_table(self.headers)
-        self.table.itemChanged.connect(self._item_changed)
-        self.table.cellDoubleClicked.connect(self._double_clicked)
+        self.model = RowModel(self.headers, self.editable_cols, self.check_cols, self)
+        self.model.edited.connect(self._edited)
+        self.table = TableView(self.model)
+        self.table.doubleClicked.connect(lambda idx: self._double_clicked(idx.row(), idx.column()))
         lay.addWidget(self.table, 1)
         self.setup_table()
 
@@ -155,8 +155,7 @@ class EntityTab(QWidget):
 
     def fill(self, ctx: Ctx | None) -> None:
         """Перестроить таблицу по ``ctx``.  Невидимая вкладка (другая вкладка окна или подвкладка) не
-        заполняется, а лишь помечается: таблица строится при показе — заполнение большой таблицы
-        занимает секунды и не должно замораживать окно, пока на неё никто не смотрит."""
+        заполняется, а лишь помечается: таблица строится при показе."""
         self.ctx = ctx
         self.stale = True
         if self.isVisible():
@@ -171,19 +170,11 @@ class EntityTab(QWidget):
         ctx = self.ctx
         self.stale = False
         vbar = self.table.verticalScrollBar().value()
-        self._filling = self._bulk = True
-        self.table.setUpdatesEnabled(False)
-        QApplication.setOverrideCursor(Qt.WaitCursor)       # большая таблица строится секунду-две
-        try:
-            self.table.setRowCount(0)
-            self._row_color = {}
+        with self.model.bulk():
+            self.model.set_rows([])
             if ctx is not None:
                 self.fill_rows(ctx)
-            self.table.fit_columns()
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.table.setUpdatesEnabled(True)
-            self._filling = self._bulk = False
+        self.table.fit_columns()
         self.table.verticalScrollBar().setValue(vbar)
         self.apply_filter()
         self.filled()
@@ -192,19 +183,21 @@ class EntityTab(QWidget):
         """Вызывается после (возможно, отложенного) заполнения таблицы."""
 
     def fill_rows(self, ctx: Ctx) -> None:
+        """Заполнить модель (``self.model.set_rows``) — вызывается внутри ``model.bulk()``."""
         raise NotImplementedError
 
     def apply_filter(self) -> None:
         shown = filter_rows(self.table, self.search.text(), self.only_problems.isChecked(), self.problem_col)
-        self.count_label.setText(f"{shown} из {self.table.rowCount()}")
+        self.count_label.setText(f"{shown} из {self.model.rowCount()}")
 
-    def _item_changed(self, item) -> None:
-        if self._filling or self.ctx is None:
+    def _edited(self, row: int, col: int) -> None:
+        if self.ctx is None:
             return
-        if self.on_item_changed(item.row(), item.column(), item):
+        if self.on_edited(row, col):
             self.owner.mapping_edited()
 
-    def on_item_changed(self, row: int, col: int, item) -> bool:
+    def on_edited(self, row: int, col: int) -> bool:
+        """Пользователь изменил ячейку (редактор или флажок); True — сопоставление изменилось."""
         return False
 
     def _double_clicked(self, row: int, col: int) -> None:
@@ -215,18 +208,18 @@ class EntityTab(QWidget):
         pass
 
     def set_status(self, row: int, col: int, text: str, color) -> None:
-        it = self.table.item(row, col)
-        it.setText(text)
-        it.setToolTip(text)
-        if self._row_color.get(row) is not None or color is not None:    # новые строки без цвета не красим
-            paint_row(self.table, row, color)
-            self._row_color[row] = color
-        if not self._bulk:                    # при заполнении высоту всех строк подгонит fit_columns
-            self.table.resizeRowToContents(row)
+        self.model.put(row, col, text, tip=text)
+        self.model.set_color(row, color)
 
     def key_at(self, row: int):
-        """Ключ строки (Qt.UserRole первой ячейки): имя сущности, для групп — занятие."""
-        return self.table.item(row, 0).data(Qt.UserRole)
+        """Ключ строки: имя сущности, для групп — занятие."""
+        return self.model.key(row)
+
+    def value_at(self, row: int, col: int):
+        return self.model.value(row, col)
+
+    def text_at(self, row: int, col: int) -> str:
+        return self.model.text(row, col)
 
 
 def _suggest(name: str, options: list[str], n: int = 3) -> str:
@@ -240,32 +233,30 @@ class ClassesTab(EntityTab):
     headers = ["Переносить", "Класс", "Полное имя", "Занятий", "Класс МЭШ", "Состояние"]
     problem_col = 5
     COL_ON, COL_NAME, COL_FULL, COL_N, COL_MESH, COL_STATUS = range(6)
+    editable_cols = (COL_MESH,)
+    check_cols = (COL_ON,)
 
     def setup_table(self):
         self.table.setItemDelegateForColumn(self.COL_MESH, ChoiceDelegate(lambda row: self.ctx.class_choices, self.table))
 
     def fill_rows(self, ctx: Ctx):
         m = ctx.m
+        rows, keys = [], []
         for c in ctx.tt.classes:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            on = c.name not in m.ignore_classes
-            it = check_cell(on, "снимите отметку, чтобы не переносить класс")
-            it.setData(Qt.UserRole, c.name)
-            self.table.setItem(r, self.COL_ON, it)
-            self.table.setItem(r, self.COL_NAME, cell(c.name))
-            self.table.setItem(r, self.COL_FULL, cell(c.full_name))
-            self.table.setItem(r, self.COL_N, cell(ctx.class_count.get(c.name, 0)))
             cur = m.classes.get(c.name)
-            self.table.setItem(r, self.COL_MESH, cell(cur or "", cur, editable=True))
-            self.table.setItem(r, self.COL_STATUS, cell(""))
+            rows.append([Cell("", c.name not in m.ignore_classes, "снимите отметку, чтобы не переносить класс"),
+                         Cell(c.name), Cell(c.full_name), Cell(ctx.class_count.get(c.name, 0)),
+                         Cell(cur or "", cur), Cell("")])
+            keys.append(c.name)
+        self.model.set_rows(rows, keys)
+        for r in range(len(rows)):
             self.update_status(r)
 
     def update_status(self, row: int):
         ctx = self.ctx
         name = self.key_at(row)
-        on = self.table.item(row, self.COL_ON).checkState() == Qt.Checked
-        cur = self.table.item(row, self.COL_MESH).data(Qt.UserRole)
+        on = self.value_at(row, self.COL_ON)
+        cur = self.value_at(row, self.COL_MESH)
         if not on:
             self.set_status(row, self.COL_STATUS, "", COLOR_OFF)
         elif not cur:
@@ -276,23 +267,19 @@ class ClassesTab(EntityTab):
         else:
             self.set_status(row, self.COL_STATUS, "", None)
 
-    def on_item_changed(self, row, col, item) -> bool:
+    def on_edited(self, row, col) -> bool:
         ctx, name = self.ctx, self.key_at(row)
         if col == self.COL_ON:
-            on = item.checkState() == Qt.Checked
+            on = self.value_at(row, col)
             if on and name in ctx.m.ignore_classes:
                 ctx.m.ignore_classes.remove(name)
             elif not on and name not in ctx.m.ignore_classes:
                 ctx.m.ignore_classes.append(name)
         elif col == self.COL_MESH:
-            ctx.m.classes[name] = item.data(Qt.UserRole)
+            ctx.m.classes[name] = self.value_at(row, col)
         else:
             return False
-        self._filling = True
-        try:
-            self.update_status(row)
-        finally:
-            self._filling = False
+        self.update_status(row)
         return True
 
 
@@ -301,31 +288,25 @@ class SubjectsTab(EntityTab):
     headers = ["Переносить", "Предмет ХроноГрафа", "Уроков", "Предметы / курсы ВД в МЭШ по приоритету (двойной щелчок)", "Групп МЭШ", "Состояние"]
     problem_col = 5
     COL_ON, COL_NAME, COL_N, COL_MESH, COL_GROUPS, COL_STATUS = range(6)
+    check_cols = (COL_ON,)
 
     def fill_rows(self, ctx: Ctx):
         m = ctx.m
         names = sorted(ctx.subject_count, key=lambda s: -ctx.subject_count[s])
-        for name in names:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            it = check_cell(name not in m.ignore_subjects, "снимите отметку, чтобы не переносить предмет")
-            it.setData(Qt.UserRole, name)
-            self.table.setItem(r, self.COL_ON, it)
-            self.table.setItem(r, self.COL_NAME, cell(name))
-            self.table.setItem(r, self.COL_N, cell(ctx.subject_count[name]))
-            self.table.setItem(r, self.COL_MESH, cell(""))
-            self.table.setItem(r, self.COL_GROUPS, cell(""))
-            self.table.setItem(r, self.COL_STATUS, cell(""))
+        rows = [[Cell("", name not in m.ignore_subjects, "снимите отметку, чтобы не переносить предмет"),
+                 Cell(name), Cell(ctx.subject_count[name]), Cell(""), Cell(""), Cell("")] for name in names]
+        self.model.set_rows(rows, names)
+        for r in range(len(rows)):
             self.update_row(r)
 
     def update_row(self, row: int):
         ctx, name = self.ctx, self.key_at(row)
-        on = self.table.item(row, self.COL_ON).checkState() == Qt.Checked
+        on = self.value_at(row, self.COL_ON)
         cur = ctx.m.subjects.get(name) or []
-        self.table.item(row, self.COL_MESH).setText(" → ".join(f"{n} (ВД)" if n in ctx.ec_only else n for n in cur))
+        self.model.put(row, self.COL_MESH, " → ".join(f"{n} (ВД)" if n in ctx.ec_only else n for n in cur))
         n_oo = sum(ctx.groups_per_subject.get(n, 0) for n in cur)
         n_ec = sum(ctx.ec_groups_per_subject.get(n, 0) for n in cur)
-        self.table.item(row, self.COL_GROUPS).setText(f"{n_oo}" + (f" + {n_ec} ВД" if n_ec else "") if cur else "")
+        self.model.put(row, self.COL_GROUPS, f"{n_oo}" + (f" + {n_ec} ВД" if n_ec else "") if cur else "")
         if not on:
             self.set_status(row, self.COL_STATUS, "", COLOR_OFF)
         elif not cur:
@@ -340,20 +321,16 @@ class SubjectsTab(EntityTab):
             else:
                 self.set_status(row, self.COL_STATUS, "", None)
 
-    def on_item_changed(self, row, col, item) -> bool:
+    def on_edited(self, row, col) -> bool:
         if col != self.COL_ON:
             return False
         ctx, name = self.ctx, self.key_at(row)
-        on = item.checkState() == Qt.Checked
+        on = self.value_at(row, col)
         if on and name in ctx.m.ignore_subjects:
             ctx.m.ignore_subjects.remove(name)
         elif not on and name not in ctx.m.ignore_subjects:
             ctx.m.ignore_subjects.append(name)
-        self._filling = True
-        try:
-            self.update_row(row)
-        finally:
-            self._filling = False
+        self.update_row(row)
         return True
 
     def on_double_clicked(self, row, col):
@@ -371,11 +348,7 @@ class SubjectsTab(EntityTab):
                               "приоритет над группами ВД.", ordered=True)
         if dlg.exec():
             ctx.m.subjects[name] = dlg.values() or None
-            self._filling = True
-            try:
-                self.update_row(row)
-            finally:
-                self._filling = False
+            self.update_row(row)
             self.owner.mapping_edited()
 
 
@@ -384,28 +357,22 @@ class TeachersTab(EntityTab):
     headers = ["Учитель ХроноГрафа", "Уроков", "Учитель МЭШ", "Состояние"]
     problem_col = 3
     COL_NAME, COL_N, COL_MESH, COL_STATUS = range(4)
+    editable_cols = (COL_MESH,)
 
     def setup_table(self):
         self.table.setItemDelegateForColumn(self.COL_MESH, ChoiceDelegate(lambda row: self.ctx.teacher_choices, self.table))
 
     def fill_rows(self, ctx: Ctx):
-        for name in sorted(ctx.teacher_count):
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            it = cell(name, name)
-            self.table.setItem(r, self.COL_NAME, it)
-            self.table.setItem(r, self.COL_N, cell(ctx.teacher_count[name]))
-            self.table.setItem(r, self.COL_MESH, cell("", None, editable=True))
-            self.table.setItem(r, self.COL_STATUS, cell(""))
+        names = sorted(ctx.teacher_count)
+        self.model.set_rows([[Cell(name), Cell(ctx.teacher_count[name]), Cell(""), Cell("")] for name in names], names)
+        for r in range(len(names)):
             self.update_row(r)
 
     def update_row(self, row: int):
         ctx, name = self.ctx, self.key_at(row)
         cur = ctx.m.teachers.get(name)
-        it = self.table.item(row, self.COL_MESH)
         tp = ctx.rd.teacher_by_id.get(cur) if cur else None
-        it.setData(Qt.UserRole, cur)
-        it.setText(f"{tp['name']} (id {cur})" if tp else (f"id {cur}" if cur else ""))
+        self.model.put(row, self.COL_MESH, f"{tp['name']} (id {cur})" if tp else (f"id {cur}" if cur else ""), cur)
         if not cur:
             last = norm_text(name).split()[0] if norm_text(name) else ""
             sugg = ", ".join(lab for lab, _ in ctx.teacher_choices if last and norm_text(lab).startswith(last))[:200]
@@ -417,15 +384,11 @@ class TeachersTab(EntityTab):
         else:
             self.set_status(row, self.COL_STATUS, "", None)
 
-    def on_item_changed(self, row, col, item) -> bool:
+    def on_edited(self, row, col) -> bool:
         if col != self.COL_MESH:
             return False
-        self.ctx.m.teachers[self.key_at(row)] = item.data(Qt.UserRole)
-        self._filling = True
-        try:
-            self.update_row(row)
-        finally:
-            self._filling = False
+        self.ctx.m.teachers[self.key_at(row)] = self.value_at(row, col)
+        self.update_row(row)
         return True
 
 
@@ -434,10 +397,12 @@ class RoomsTab(EntityTab):
     headers = ["Кабинет ХроноГрафа", "Уроков", "Кабинет МЭШ", "Состояние"]
     problem_col = 3
     COL_NAME, COL_N, COL_MESH, COL_STATUS = range(4)
+    editable_cols = (COL_MESH,)
 
     def setup_table(self):
         self.table.setItemDelegateForColumn(self.COL_MESH, ChoiceDelegate(lambda row: self.ctx.room_choices, self.table))
         # таблица префиксов → здание
+        self._filling = False
         self.prefixes = make_table(["Префикс кабинета", "Здание МЭШ (для автоподбора номеров)"])
         self.prefixes.setItemDelegateForColumn(1, ChoiceDelegate(lambda row: self.ctx.building_choices, self.prefixes))
         self.prefixes.setMaximumHeight(140)
@@ -473,22 +438,16 @@ class RoomsTab(EntityTab):
         self.owner.mapping_edited()
 
     def fill_rows(self, ctx: Ctx):
-        for name in sorted(ctx.cabinet_count, key=_natural):
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            self.table.setItem(r, self.COL_NAME, cell(name, name))
-            self.table.setItem(r, self.COL_N, cell(ctx.cabinet_count[name]))
-            self.table.setItem(r, self.COL_MESH, cell("", None, editable=True))
-            self.table.setItem(r, self.COL_STATUS, cell(""))
+        names = sorted(ctx.cabinet_count, key=_natural)
+        self.model.set_rows([[Cell(name), Cell(ctx.cabinet_count[name]), Cell(""), Cell("")] for name in names], names)
+        for r in range(len(names)):
             self.update_row(r)
 
     def update_row(self, row: int):
         ctx, name = self.ctx, self.key_at(row)
         cur = ctx.m.rooms.get(name)
         room = ctx.rd.room_by_id.get(cur) if cur else None
-        it = self.table.item(row, self.COL_MESH)
-        it.setData(Qt.UserRole, cur)
-        it.setText(ctx.room_label(room) if room else (f"id {cur}" if cur else ""))
+        self.model.put(row, self.COL_MESH, ctx.room_label(room) if room else (f"id {cur}" if cur else ""), cur)
         if not cur:
             self.set_status(row, self.COL_STATUS, "не сопоставлен: уроки получат кабинет учителя/здания по умолчанию, ВД — без кабинета", COLOR_WARN)
         elif room is None:
@@ -498,15 +457,11 @@ class RoomsTab(EntityTab):
         else:
             self.set_status(row, self.COL_STATUS, "", None)
 
-    def on_item_changed(self, row, col, item) -> bool:
+    def on_edited(self, row, col) -> bool:
         if col != self.COL_MESH:
             return False
-        self.ctx.m.rooms[self.key_at(row)] = item.data(Qt.UserRole)
-        self._filling = True
-        try:
-            self.update_row(row)
-        finally:
-            self._filling = False
+        self.ctx.m.rooms[self.key_at(row)] = self.value_at(row, col)
+        self.update_row(row)
         return True
 
 
@@ -530,92 +485,73 @@ class GroupsTab(EntityTab):
         self._rows_by_clsgrp: dict[int, list[int]] = defaultdict(list)
         self._resolver = GroupResolver(ctx.tt, ctx.rd, ctx.m)
         weeks = range(max(1, ctx.tt.week_count))
+        rows, keys = [], []
         for key, l in seen.items():
             n_les = max(per_week[(key, w)] for w in weeks)
             for link in self._resolver.resolve_chain(l):
-                r = self.table.rowCount()
-                self.table.insertRow(r)
-                self._rows_by_clsgrp[l.clsgrp_index].append(r)
-                self.table.setItem(r, self.COL_CLS, cell(l.cls, l))
-                self.table.setItem(r, self.COL_SUBJ, cell(l.subject))
-                self.table.setItem(r, self.COL_GRP, cell(l.group or ""))
-                prio = cell(link.prio, link.prio)
-                prio.setToolTip(f"приоритет {link.prio}: {link.name or '—'}")
-                self.table.setItem(r, self.COL_PRIO, prio)
-                self.table.setItem(r, self.COL_TEACHER, cell(l.teacher))
-                self.table.setItem(r, self.COL_N, cell(n_les, n_les))
-                for c in (self.COL_HOURS, self.COL_STATUS, self.COL_MESH, self.COL_MANUAL, self.COL_WHY):
-                    self.table.setItem(r, c, cell(""))
-        self._kinds = [("ok", False)] * self.table.rowCount()      # по строкам: (ok | weak | over | bad, группа ВД)
-        self.refresh_rows(range(self.table.rowCount()))
+                self._rows_by_clsgrp[l.clsgrp_index].append(len(rows))
+                rows.append([Cell(l.cls), Cell(l.subject), Cell(l.group or ""),
+                             Cell(link.prio, link.prio, f"приоритет {link.prio}: {link.name or '—'}"),
+                             Cell(l.teacher), Cell(n_les, n_les),
+                             Cell(""), Cell(""), Cell(""), Cell(""), Cell("")])
+                keys.append(l)
+        self.model.set_rows(rows, keys)
+        self._kinds = [("ok", False)] * len(rows)      # по строкам: (ok | weak | over | bad, группа ВД)
+        self.refresh_rows(range(len(rows)), self._resolver)     # тот же resolver: цепочки уже посчитаны
 
     def prio_at(self, row: int) -> int:
-        return self.table.item(row, self.COL_PRIO).data(Qt.UserRole)
+        return self.value_at(row, self.COL_PRIO)
 
     def filled(self) -> None:
         self.owner.update_summary()          # сводка считается по строкам этой таблицы
 
-    def refresh_rows(self, rows: Iterable[int]) -> list[int]:
+    def refresh_rows(self, rows: Iterable[int], resolver: GroupResolver | None = None) -> list[int]:
         """Заново выбрать группу МЭШ в строках ``rows``, переписав только изменившиеся ячейки
         (таблица не перестраивается — прокрутка, выделение и ширина столбцов остаются).
         Возвращает номера изменившихся строк."""
-        ctx, m = self.ctx, self.ctx.m
-        resolver = self._resolver = GroupResolver(ctx.tt, ctx.rd, m)
+        ctx, m, model = self.ctx, self.ctx.m, self.model
+        resolver = self._resolver = resolver or GroupResolver(ctx.tt, ctx.rd, m)
         changed = []
-        was_filling, self._filling = self._filling, True
-        try:
-            for r in rows:
-                l, prio = self.key_at(r), self.prio_at(r)
-                chain = resolver.resolve_chain(l)
-                link = next((lk for lk in chain if lk.prio == prio), None)
-                if link is None:               # звено исчезло (снят ручной выбор по названию без групп) — до перезаполнения
-                    continue
-                g, why = link.group, link.why
-                explicit = m.groups.get(group_key(l, prio))
-                eg = ctx.rd.any_group(explicit) if explicit else None
-                tid = resolver.teacher_id(l)
-                hours = ctx.rd.group_hours_span(g, tid) if g else ""
-                n_les = self.table.item(r, self.COL_N).data(Qt.UserRole)
-                group_teachers = [t.get("id") for t in (g or {}).get("teachers") or []]
-                if g is None:
-                    kind, status, color = "bad", _short_reason(why), COLOR_BAD
-                elif "проверьте" in why:
-                    kind, status, color = "weak", "проверьте", COLOR_WARN
-                elif group_teachers and (tid if tid is not None else (group_teachers[0] if len(group_teachers) == 1 else None)) not in group_teachers:
-                    # план такую группу пропустит: сервер принимает только учителя, привязанного к группе
-                    kind, status, color = "weak", "учитель не привязан к группе МЭШ", COLOR_WARN
-                else:
-                    kind, status, color = "ok", "", None
-                    if prio == 1 and hours and n_les > min(_hours_range(hours)):
-                        rest = [lk for lk in chain[1:] if lk.group]
-                        if rest:
-                            why += f"; часов меньше уроков — остальные по приоритету {', '.join(str(lk.prio) for lk in rest)}"
-                        else:
-                            kind, status, color = "over", "уроков больше часов группы — лишние встанут сверх часов", COLOR_WARN
-                self._kinds[r] = (kind, is_ec(g))
-                touched = self._put(r, self.COL_HOURS, hours, tip="часов в неделю по нагрузке учителя в МЭШ" if hours else "нет данных о нагрузке")
-                touched |= self._put(r, self.COL_MESH, ctx.group_short(g) if g else "", tip=ctx.group_label(g) if g else "")
-                touched |= self._put(r, self.COL_WHY, why, tip=why)
-                touched |= self._put(r, self.COL_MANUAL, ctx.group_short(eg) if eg else (f"id {explicit}" if explicit else ""),
-                                     explicit, tip=ctx.group_label(eg) if eg else "")
-                if touched or self.table.item(r, self.COL_STATUS).text() != status:
-                    self.set_status(r, self.COL_STATUS, status, color)
-                    changed.append(r)
-        finally:
-            self._filling = was_filling
+        for r in rows:
+            l, prio = self.key_at(r), self.prio_at(r)
+            chain = resolver.resolve_chain(l)
+            link = next((lk for lk in chain if lk.prio == prio), None)
+            if link is None:               # звено исчезло (снят ручной выбор по названию без групп) — до перезаполнения
+                continue
+            g, why = link.group, link.why
+            explicit = m.groups.get(group_key(l, prio))
+            eg = ctx.rd.any_group(explicit) if explicit else None
+            tid = resolver.teacher_id(l)
+            hours = ctx.rd.group_hours_span(g, tid) if g else ""
+            n_les = self.value_at(r, self.COL_N)
+            group_teachers = [t.get("id") for t in (g or {}).get("teachers") or []]
+            if g is None:
+                kind, status, color = "bad", _short_reason(why), COLOR_BAD
+            elif "проверьте" in why:
+                kind, status, color = "weak", "проверьте", COLOR_WARN
+            elif group_teachers and (tid if tid is not None else (group_teachers[0] if len(group_teachers) == 1 else None)) not in group_teachers:
+                # план такую группу пропустит: сервер принимает только учителя, привязанного к группе
+                kind, status, color = "weak", "учитель не привязан к группе МЭШ", COLOR_WARN
+            else:
+                kind, status, color = "ok", "", None
+                if prio == 1 and hours and n_les > min(_hours_range(hours)):
+                    rest = [lk for lk in chain[1:] if lk.group]
+                    if rest:
+                        why += f"; часов меньше уроков — остальные по приоритету {', '.join(str(lk.prio) for lk in rest)}"
+                    else:
+                        kind, status, color = "over", "уроков больше часов группы — лишние встанут сверх часов", COLOR_WARN
+            self._kinds[r] = (kind, is_ec(g))
+            touched = model.put(r, self.COL_HOURS, hours, tip="часов в неделю по нагрузке учителя в МЭШ" if hours else "нет данных о нагрузке")
+            touched |= model.put(r, self.COL_MESH, ctx.group_short(g) if g else "", tip=ctx.group_label(g) if g else "")
+            touched |= model.put(r, self.COL_WHY, why, tip=why)
+            touched |= model.put(r, self.COL_MANUAL, ctx.group_short(eg) if eg else (f"id {explicit}" if explicit else ""),
+                                 explicit, tip=ctx.group_label(eg) if eg else "")
+            if touched or model.text(r, self.COL_STATUS) != status:
+                self.set_status(r, self.COL_STATUS, status, color)
+                changed.append(r)
         self.stats = Counter(kind for kind, _ in self._kinds)
         self.stats["ec"] = sum(ec for _, ec in self._kinds)
         return changed
-
-    def _put(self, row: int, col: int, text: str, value=None, tip: str = "") -> bool:
-        """Записать текст, значение и подсказку ячейки; True, если что-то изменилось."""
-        it = self.table.item(row, col)
-        if it.text() == text and it.data(Qt.UserRole) == value and it.toolTip() == tip:
-            return False
-        it.setText(text)
-        it.setData(Qt.UserRole, value)
-        it.setToolTip(tip)
-        return True
 
     def on_double_clicked(self, row, col):
         ctx, l, prio = self.ctx, self.key_at(row), self.prio_at(row)
@@ -639,8 +575,8 @@ class GroupsTab(EntityTab):
                           len(g.get("student_ids") or []), "ВД" if is_ec(g) else "",
                           "; ".join(taken.get(g["id"], [])), g["id"]],
                          g["id"], g.get("subject_name") == name if name else g.get("subject_name") in names))
-        auto = self.table.item(row, self.COL_MESH).text()
-        why = self.table.item(row, self.COL_WHY).text()
+        auto = self.text_at(row, self.COL_MESH)
+        why = self.text_at(row, self.COL_WHY)
         hint = (f"Занятие: {l.cls}, {l.subject}" + (f"/{l.group}" if l.group else "") + f", учитель {l.teacher or '—'}"
                 + (f"; приоритет {prio} — «{name}»" if len(names) > 1 else "") + ". "
                 + (f"Сейчас выбрана автоматически: {auto} ({why})." if auto else f"Автоматически группа не выбрана: {why or '—'}.")

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -16,7 +15,7 @@ from PySide6.QtWidgets import (
 
 from .. import uploader
 from ..uploader import Journal, journal_key
-from .common import ask, cell, check_cell, error, filter_rows, make_table
+from .common import Cell, RowModel, TableView, ask, error, filter_rows
 
 
 class UndoTab(QWidget):
@@ -49,9 +48,10 @@ class UndoTab(QWidget):
         self.count_label = QLabel("")
         top.addWidget(self.count_label)
         lay.addLayout(top)
-        self.table = make_table(self.COLS)
+        self.model = RowModel(self.COLS, check_cols=(0,), parent=self)
+        self.model.edited.connect(self._changed)
+        self.table = TableView(self.model)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table.itemChanged.connect(self._changed)
         lay.addWidget(self.table, 1)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
@@ -76,48 +76,40 @@ class UndoTab(QWidget):
         except (OSError, ValueError) as e:
             self.records = []
             error(self, "Журнал", f"Не удалось прочитать журнал {path}:\n{e}")
-        self.table.blockSignals(True)
-        self.table.setRowCount(0)
+        rows, keys = [], []
         for rec in self.records:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            it = check_cell(False)
-            it.setData(Qt.UserRole, journal_key(rec))     # (вид, id): у уроков и ВД разные нумерации
-            self.table.setItem(r, 0, it)
             vals = ["ВД" if rec.get("kind") == "ec" else "урок", rec.get("class"), rec.get("date"),
                     rec.get("begin_time") or rec.get("lesson"), rec.get("group_name"), rec.get("teacher_id"),
                     rec.get("room_id"), rec.get("week"), rec.get("item_id"), rec.get("created_at")]
-            for c, v in enumerate(vals, start=1):
-                self.table.setItem(r, c, cell("" if v is None else v))
+            rows.append([Cell("", False)] + [Cell("" if v is None else v) for v in vals])
+            keys.append(journal_key(rec))     # (вид, id): у уроков и ВД разные нумерации
+        self.model.set_rows(rows, keys)
         self.table.fit_columns()
-        self.table.blockSignals(False)
         self.apply_filter()
 
     def apply_filter(self):
         filter_rows(self.table, self.search.text())
         self._update_count()
 
-    def _changed(self, item):
-        if item.column() == 0:
+    def _changed(self, row, col):
+        if col == 0:
             self._update_count()
 
     def _update_count(self):
-        n = sum(1 for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked)
-        shown = sum(1 for r in range(self.table.rowCount()) if not self.table.isRowHidden(r))
+        n = sum(1 for row in self.model.rows if row[0].value)
+        shown = sum(1 for r in range(self.model.rowCount()) if not self.table.isRowHidden(r))
         self.count_label.setText(f"в журнале {len(self.records)}, показано {shown}, отмечено {n}")
         self.undo_btn.setEnabled(n > 0)
 
     def _check_visible(self, on: bool, all_rows: bool = False):
-        self.table.blockSignals(True)
-        for r in range(self.table.rowCount()):
+        for r, row in enumerate(self.model.rows):
             if all_rows or not self.table.isRowHidden(r):
-                self.table.item(r, 0).setCheckState(Qt.Checked if on else Qt.Unchecked)
-        self.table.blockSignals(False)
+                row[0].value = on
+        self.model.notify_rows(0, self.model.rowCount() - 1)
         self._update_count()
 
     def checked_keys(self) -> set[uploader.ItemKey]:
-        return {tuple(self.table.item(r, 0).data(Qt.UserRole)) for r in range(self.table.rowCount())
-                if self.table.item(r, 0).checkState() == Qt.Checked}
+        return {tuple(key) for key, row in zip(self.model.keys, self.model.rows) if row[0].value}
 
     def undo(self):
         st = self.state

@@ -7,7 +7,7 @@ import threading
 import traceback
 from collections.abc import Callable
 
-from PySide6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QRect, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -27,7 +27,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QStyle,
+    QStyleOptionViewItem,
     QStyledItemDelegate,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QTreeWidget,
@@ -100,22 +102,19 @@ def scrollable(body: QWidget) -> QScrollArea:
 
 
 # ---------------------------------------------------------------------- таблицы
-class Table(QTableWidget):
-    """Таблица с переносом текста в ячейках.
+class _FitColumns:
+    """Подгонка столбцов под содержимое и ширину окна (общая для QTableWidget и QTableView).
 
-    :meth:`fit_columns` подгоняет столбцы под содержимое и ширину окна: столбец не шире MAX_COL; если
-    столбцы не помещаются, широкие ужимаются (не уже заголовка и MIN_COL), а последний столбец
-    (обычно «Состояние») получает остаток ширины, но не меньше STRETCH_MIN — длинные записи
-    переносятся на несколько строк, а не обрезаются и не уезжают за край.  Высота строк следует за
-    перенесённым текстом, в том числе после перетаскивания границ столбцов и изменения размера окна.
+    :meth:`fit_columns` подгоняет столбцы: столбец не шире MAX_COL; если столбцы не помещаются,
+    широкие ужимаются (не уже заголовка и MIN_COL), а последний столбец (обычно «Состояние»)
+    получает остаток ширины, но не меньше STRETCH_MIN — длинные записи переносятся на несколько
+    строк, а не обрезаются и не уезжают за край.
     """
     MAX_COL = 380
     MIN_COL = 110
     STRETCH_MIN = 260
 
-    def __init__(self, headers: list[str]):
-        super().__init__(0, len(headers))
-        self.setHorizontalHeaderLabels(headers)
+    def _init_fit(self) -> None:
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setAlternatingRowColors(True)
@@ -123,21 +122,15 @@ class Table(QTableWidget):
         self.setWordWrap(True)
         hh = self.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.Interactive)
-        hh.setResizeContentsPrecision(200)     # ширину по содержимому оценивать по первым 200 строкам: в 7 раз быстрее
         hh.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         hh.setTextElideMode(Qt.ElideRight)
         hh.setStretchLastSection(True)
-        self._stretch = len(headers) - 1
+        # ширину столбца по содержимому оценивать по первым 200 строкам, а не по всем
+        self.verticalHeader().setResizeContentsPrecision(200)
+        hh.setResizeContentsPrecision(200)
         self._max_col = self.MAX_COL
         self._fit_pending = False          # подгонка нужна, но таблица ещё не показана (ширина неизвестна)
         self._fit_scheduled = False
-        # высота строк после изменения ширины столбцов — с задержкой: при перетаскивании границы
-        # столбца сигналы идут непрерывно, а пересчёт полутора тысяч строк занимает заметное время
-        self._rows_timer = QTimer(self)
-        self._rows_timer.setSingleShot(True)
-        self._rows_timer.setInterval(150)
-        self._rows_timer.timeout.connect(self.resizeRowsToContents)
-        hh.sectionResized.connect(lambda *_: self._rows_timer.start())
 
     def fit_columns(self, max_width: int | None = None) -> None:
         """Подогнать столбцы и высоту строк (после текущих событий; для скрытой таблицы — при показе)."""
@@ -165,16 +158,16 @@ class Table(QTableWidget):
         self._fit_scheduled = False
         if not self._fit_pending or not self.isVisible():
             return
-        self._fit_pending = False
         self.resizeColumnsToContents()
-        n, hh = self.columnCount(), self.horizontalHeader()
+        n, hh, model = self.model().columnCount(), self.horizontalHeader(), self.model()
+        stretch = n - 1
         fm = hh.fontMetrics()
         widths = [min(self.columnWidth(c), self._max_col) for c in range(n)]
-        floors = [max(self.MIN_COL, min(fm.horizontalAdvance(self.horizontalHeaderItem(c).text()) + 16, 180))
+        floors = [max(self.MIN_COL, min(fm.horizontalAdvance(str(model.headerData(c, Qt.Horizontal) or "")) + 16, 180))
                   for c in range(n)]
-        others = [c for c in range(n) if c != self._stretch]
+        others = [c for c in range(n) if c != stretch]
         avail = self.viewport().width() - self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
-        overflow = sum(widths[c] for c in others) + min(widths[self._stretch], self.STRETCH_MIN) - avail
+        overflow = sum(widths[c] for c in others) + min(widths[stretch], self.STRETCH_MIN) - avail
         shrinkable = [c for c in others if widths[c] > floors[c]]
         excess = sum(widths[c] - floors[c] for c in shrinkable)
         if overflow > 0 and excess > 0:
@@ -182,11 +175,28 @@ class Table(QTableWidget):
             for c in shrinkable:
                 widths[c] -= round((widths[c] - floors[c]) * k)
         # растягиваемому столбцу — остаток (Qt не даёт ему стать уже заданной здесь ширины)
-        widths[self._stretch] = min(widths[self._stretch], max(avail - sum(widths[c] for c in others), self.STRETCH_MIN))
+        widths[stretch] = min(widths[stretch], max(avail - sum(widths[c] for c in others), self.STRETCH_MIN))
         for c, w in enumerate(widths):
             self.setColumnWidth(c, w)
         hh.resizeSections()                   # растянуть последний столбец сразу, не дожидаясь изменения размера окна
-        self._rows_timer.stop()
+        self._fit_pending = False
+        self._fit_rows()
+
+    def _fit_rows(self) -> None:
+        raise NotImplementedError
+
+
+class Table(_FitColumns, QTableWidget):
+    """Небольшая таблица на QTableWidget (десятки строк) с переносом текста и подгонкой столбцов.
+    Для больших таблиц — :class:`TableView` с :class:`RowModel`."""
+
+    def __init__(self, headers: list[str]):
+        super().__init__(0, len(headers))
+        self.setHorizontalHeaderLabels(headers)
+        self._init_fit()
+        self.horizontalHeader().sectionResized.connect(lambda *_: self.resizeRowsToContents())
+
+    def _fit_rows(self) -> None:
         self.resizeRowsToContents()
 
 
@@ -194,8 +204,298 @@ def make_table(headers: list[str]) -> Table:
     return Table(headers)
 
 
-_FLAGS_RO = Qt.ItemIsSelectable | Qt.ItemIsEnabled          # флаги заранее: cell() зовётся десятками тысяч раз
-_FLAGS_EDIT = _FLAGS_RO | Qt.ItemIsEditable
+class Cell:
+    """Ячейка :class:`RowModel`: текст, значение (Qt.UserRole; в столбце с флажком — отмечено ли) и подсказка."""
+    __slots__ = ("text", "value", "tip")
+
+    def __init__(self, text="", value=None, tip: str = ""):
+        self.text = "" if text is None else str(text)
+        self.value = value
+        self.tip = tip
+
+
+_BLACK = QBrush(QColor("black"))
+_brushes: dict[str, QBrush] = {}
+_DISPLAY, _EDIT, _TOOLTIP, _USER = Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole, Qt.ItemDataRole.ToolTipRole, Qt.ItemDataRole.UserRole
+_BACKGROUND, _FOREGROUND, _CHECK = Qt.ItemDataRole.BackgroundRole, Qt.ItemDataRole.ForegroundRole, Qt.ItemDataRole.CheckStateRole
+_CHECKED, _UNCHECKED = Qt.CheckState.Checked, Qt.CheckState.Unchecked
+_FLAGS_RO = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+_FLAGS_EDIT = _FLAGS_RO | Qt.ItemFlag.ItemIsEditable
+_EDITABLE, _CHECKABLE = Qt.ItemFlag.ItemIsEditable, Qt.ItemFlag.ItemIsUserCheckable
+
+
+def _brush(color: QColor) -> QBrush:
+    key = color.name()
+    b = _brushes.get(key)
+    if b is None:
+        b = _brushes[key] = QBrush(color)
+    return b
+
+
+class RowModel(QAbstractTableModel):
+    """Табличная модель поверх списков :class:`Cell`: данные лежат в Python, а виджет запрашивает
+    только то, что видно на экране, — таблица на тысячи строк строится мгновенно (у QTableWidget на
+    каждую ячейку заводится свой объект).
+
+    Столбцы ``editable_cols`` редактируются (обычно через ChoiceDelegate), ``check_cols`` показывают
+    флажок (значение ячейки — bool).  ``keys`` — ключ строки (имя сущности, занятие).  Правки
+    пользователя (редактор, флажок) приходят сигналом ``edited``; программные изменения
+    (:meth:`put`, :meth:`set_color`, :meth:`set_rows`) его не вызывают.  Массовое заполнение —
+    внутри ``with model.bulk():`` — одна перезагрузка представления вместо тысяч уведомлений.
+    """
+    edited = Signal(int, int)
+
+    def __init__(self, headers: list[str], editable_cols=(), check_cols=(), parent=None):
+        super().__init__(parent)
+        self.headers = list(headers)
+        self.editable_cols = frozenset(editable_cols)
+        self.check_cols = frozenset(check_cols)
+        self.rows: list[list[Cell]] = []
+        self.keys: list = []
+        self.colors: list[QColor | None] = []
+        self._bulk = False
+
+    # --- QAbstractTableModel
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.headers)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal and 0 <= section < len(self.headers):
+            return self.headers[section]
+        return None
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.NoItemFlags
+        c = index.column()
+        f = _FLAGS_RO
+        if c in self.editable_cols:
+            f |= _EDITABLE
+        if c in self.check_cols:
+            f |= _CHECKABLE
+        return f
+
+    def data(self, index, role=_DISPLAY):
+        # представление зовёт data() десятки тысяч раз; сокращённые имена вида Qt.DisplayRole ищутся
+        # по всем перечислениям Qt (~7 мкс каждое) — поэтому роли сравниваются с константами модуля
+        if not index.isValid():
+            return None
+        r, c = index.row(), index.column()
+        if role == _DISPLAY or role == _EDIT:
+            return None if c in self.check_cols else self.rows[r][c].text
+        if role == _BACKGROUND:
+            color = self.colors[r]
+            return _brush(color) if color is not None else None
+        if role == _FOREGROUND:
+            return _BLACK if self.colors[r] is not None else None
+        if role == _CHECK:
+            if c in self.check_cols:
+                return _CHECKED if self.rows[r][c].value else _UNCHECKED
+            return None
+        if role == _TOOLTIP:
+            return self.rows[r][c].tip or None
+        if role == _USER:
+            return self.rows[r][c].value
+        return None
+
+    def setData(self, index, value, role=_EDIT):
+        if not index.isValid() or not self._apply(index.row(), index.column(), role, value):
+            return False
+        self.dataChanged.emit(index, index)
+        self.edited.emit(index.row(), index.column())
+        return True
+
+    def setItemData(self, index, roles):
+        # ChoiceDelegate пишет значение и текст одним вызовом — одно уведомление, а не по одному на роль
+        if not index.isValid():
+            return False
+        ok = False
+        for role, value in roles.items():
+            ok |= self._apply(index.row(), index.column(), role, value)
+        if ok:
+            self.dataChanged.emit(index, index)
+            self.edited.emit(index.row(), index.column())
+        return ok
+
+    def _apply(self, r: int, c: int, role, value) -> bool:
+        cell = self.rows[r][c]
+        role = int(role)
+        if role == _CHECK and c in self.check_cols:
+            cell.value = value == _CHECKED if isinstance(value, Qt.CheckState) else int(value) == _CHECKED.value
+        elif role == _EDIT or role == _DISPLAY:
+            cell.text = "" if value is None else str(value)
+        elif role == _USER:
+            cell.value = value
+        else:
+            return False
+        return True
+
+    # --- программный доступ
+    def bulk(self):
+        """Контекст массового изменения: представление перезагружается один раз по выходу."""
+        return _Bulk(self)
+
+    def set_rows(self, rows: list[list[Cell]], keys: list | None = None, colors: list | None = None) -> None:
+        if not self._bulk:
+            with self.bulk():
+                self.set_rows(rows, keys, colors)
+            return
+        n = len(rows)
+        self.rows = rows
+        self.keys = list(keys) if keys is not None else [None] * n
+        self.colors = list(colors) if colors is not None else [None] * n
+
+    def cell(self, row: int, col: int) -> Cell:
+        return self.rows[row][col]
+
+    def text(self, row: int, col: int) -> str:
+        return self.rows[row][col].text
+
+    def value(self, row: int, col: int):
+        return self.rows[row][col].value
+
+    def key(self, row: int):
+        return self.keys[row]
+
+    def put(self, row: int, col: int, text, value=None, tip: str = "") -> bool:
+        """Записать текст, значение и подсказку ячейки; True, если что-то изменилось."""
+        cell = self.rows[row][col]
+        text = "" if text is None else str(text)
+        if cell.text == text and cell.value == value and cell.tip == tip:
+            return False
+        cell.text, cell.value, cell.tip = text, value, tip
+        self._changed(row, col, col)
+        return True
+
+    def set_check(self, row: int, col: int, on: bool) -> None:
+        self.rows[row][col].value = bool(on)
+        self._changed(row, col, col)
+
+    def set_color(self, row: int, color: QColor | None) -> None:
+        if self.colors[row] is color or (color is not None and self.colors[row] is not None and color == self.colors[row]):
+            return
+        self.colors[row] = color
+        self._changed(row, 0, len(self.headers) - 1)
+
+    def notify_rows(self, first: int, last: int) -> None:
+        """Сообщить представлению об изменении строк ``first..last`` (после серии тихих правок)."""
+        if not self._bulk and last >= first:
+            self.dataChanged.emit(self.index(first, 0), self.index(last, len(self.headers) - 1))
+
+    def _changed(self, row: int, c0: int, c1: int) -> None:
+        if not self._bulk:
+            self.dataChanged.emit(self.index(row, c0), self.index(row, c1))
+
+
+class _Bulk:
+    def __init__(self, model: RowModel):
+        self.model = model
+
+    def __enter__(self):
+        self.model.beginResetModel()
+        self.model._bulk = True
+
+    def __exit__(self, *exc):
+        self.model._bulk = False
+        self.model.endResetModel()
+
+
+class TableView(_FitColumns, QTableView):
+    """Представление для :class:`RowModel`.  Высота строк (с переносом текста) считается лениво —
+    только для строк в видимой области, при прокрутке и изменении ширины столбцов: пересчёт всех
+    строк большой таблицы занимал бы секунды."""
+
+    def __init__(self, model: RowModel):
+        super().__init__()
+        self.setModel(model)
+        self._init_fit()
+        self._sized: set[int] = set()          # строки, высота которых уже подогнана
+        self._one_line = 0                     # высота однострочной ячейки (для строк, ещё не измеренных)
+        self._rows_timer = QTimer(self)
+        self._rows_timer.setSingleShot(True)
+        self._rows_timer.setInterval(0)
+        self._rows_timer.timeout.connect(self._size_visible_rows)
+        self.horizontalHeader().sectionResized.connect(self._columns_changed)
+        self.verticalScrollBar().valueChanged.connect(lambda *_: self._rows_timer.start())
+        model.modelReset.connect(self._reset)
+        model.dataChanged.connect(self._data_changed)
+        model.rowsInserted.connect(self._reset)
+        model.rowsRemoved.connect(self._reset)
+
+    def _fit_rows(self) -> None:
+        self._sized.clear()
+        self._size_visible_rows()
+
+    def _reset(self, *_) -> None:
+        self._sized.clear()
+        self._rows_timer.start()
+
+    def _data_changed(self, tl, br, *_) -> None:
+        self._sized.difference_update(range(tl.row(), br.row() + 1))
+        self._rows_timer.start()
+
+    def _columns_changed(self, *_) -> None:
+        # при перетаскивании границы столбца сигналы идут непрерывно — пересчёт с задержкой
+        # (столбцы, выставленные самой подгонкой, учтёт _fit_rows)
+        if not self._fit_pending:
+            self._sized.clear()
+            self._rows_timer.start(150)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rows_timer.start()
+
+    def rows_hidden_changed(self) -> None:
+        self._rows_timer.start()
+
+    def _size_visible_rows(self) -> None:
+        self._rows_timer.stop()
+        n = self.model().rowCount()
+        if not self.isVisible() or not n or self._fit_pending:      # строки измерит подгонка столбцов
+            return
+        vh = self.verticalHeader()
+        for _ in range(8):                     # подогнанные строки меняют высоту — видимый диапазон сдвигается
+            top = max(0, self.rowAt(0))
+            bottom = self.rowAt(self.viewport().height())
+            if bottom < 0:
+                bottom = n - 1
+            todo = [r for r in range(top, bottom + 1) if r not in self._sized and not self.isRowHidden(r)]
+            if not todo:
+                break
+            for r in todo:
+                self.resizeRowToContents(r)
+                self._sized.add(r)
+            if not self._one_line:
+                # неизмеренные строки — высотой с однострочную (самая низкая ячейка первой строки),
+                # чтобы при прокрутке строки не «прыгали»
+                opt = QStyleOptionViewItem()
+                self.initViewItemOption(opt)
+                model, dlg = self.model(), self.itemDelegate()
+                self._one_line = max(vh.minimumSectionSize(),
+                                     min(dlg.sizeHint(opt, model.index(todo[0], c)).height() for c in range(model.columnCount())))
+            if vh.defaultSectionSize() != self._one_line:       # перезагрузка модели сбрасывает высоту по умолчанию
+                vh.setDefaultSectionSize(self._one_line)
+
+
+def filter_rows(view: TableView, text: str, only_problems: bool = False, problem_col: int | None = None) -> int:
+    """Скрывает строки, не содержащие текст (в любой ячейке) либо не помеченные как проблемные.
+    Проблемной считается строка с непустым текстом в столбце problem_col.  Возвращает число видимых строк."""
+    needle = text.strip().lower()
+    shown = 0
+    model: RowModel = view.model()
+    for r, row in enumerate(model.rows):
+        hide = False
+        if needle:
+            hide = not any(needle in c.text.lower() for c in row)
+        if not hide and only_problems and problem_col is not None:
+            hide = not row[problem_col].text.strip()
+        view.setRowHidden(r, hide)
+        shown += not hide
+    view.rows_hidden_changed()
+    return shown
 
 
 def cell(text, value=None, editable: bool = False, color: QColor | None = None, tip: str = "") -> QTableWidgetItem:
@@ -218,37 +518,6 @@ def check_cell(checked: bool, tip: str = "") -> QTableWidgetItem:
     if tip:
         it.setToolTip(tip)
     return it
-
-
-def paint_row(table: QTableWidget, row: int, color: QColor | None) -> None:
-    for c in range(table.columnCount()):
-        it = table.item(row, c)
-        if it is None:
-            continue
-        if color is None:
-            it.setData(Qt.BackgroundRole, None)
-            it.setData(Qt.ForegroundRole, None)
-        else:
-            it.setBackground(QBrush(color))
-            it.setForeground(QBrush(QColor("black")))
-
-
-def filter_rows(table: QTableWidget, text: str, only_problems: bool = False, problem_col: int | None = None) -> int:
-    """Скрывает строки, не содержащие текст (в любой ячейке) либо не помеченные как проблемные.
-    Проблемной считается строка с непустым текстом в столбце problem_col.  Возвращает число видимых строк."""
-    needle = text.strip().lower()
-    shown = 0
-    for r in range(table.rowCount()):
-        hide = False
-        if needle:
-            hide = not any((table.item(r, c) is not None and needle in table.item(r, c).text().lower())
-                           for c in range(table.columnCount()))
-        if not hide and only_problems and problem_col is not None:
-            it = table.item(r, problem_col)
-            hide = it is None or not it.text().strip()
-        table.setRowHidden(r, hide)
-        shown += not hide
-    return shown
 
 
 class WrapDelegate(QStyledItemDelegate):
