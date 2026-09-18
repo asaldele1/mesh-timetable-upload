@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import chngf
-from ..mapping import GroupResolver, Mapping, group_key, is_ec, match_all, relevant_lessons
+from ..mapping import GroupResolver, Mapping, group_key, is_ec, match_all, relevant_lessons, split_group_key
 from ..refdata import ec_course_name, norm_text
 from .common import (
     COLOR_BAD,
@@ -31,6 +31,7 @@ from .common import (
     COLOR_WARN,
     CheckListDialog,
     ChoiceDelegate,
+    PickDialog,
     cell,
     check_cell,
     error,
@@ -94,15 +95,6 @@ class Ctx:
         cu_name = self.m.classes.get(cls_name)
         cu = self.rd.class_unit(cu_name) if cu_name else None
         return cu["id"] if cu else None
-
-    def group_choices(self, cls_name: str, subject: str) -> list[tuple[str, int]]:
-        cu_id = self.class_unit_id(cls_name)
-        if cu_id is None:
-            return []
-        want = set(self.m.subjects.get(subject) or [])
-        groups = list(self.rd.groups_by_class.get(cu_id, [])) + list(self.rd.ec_groups_by_class.get(cu_id, []))
-        groups.sort(key=lambda g: (g.get("subject_name") not in want, is_ec(g), (g.get("name") or "").lower()))
-        return [(self.group_label(g), g["id"]) for g in groups]
 
 
 def _short_reason(why: str) -> str:
@@ -279,7 +271,7 @@ class ClassesTab(EntityTab):
 
 # ---------------------------------------------------------------------- предметы
 class SubjectsTab(EntityTab):
-    headers = ["Переносить", "Предмет ХроноГрафа", "Уроков", "Предметы / курсы ВД в МЭШ (двойной щелчок)", "Групп МЭШ", "Состояние"]
+    headers = ["Переносить", "Предмет ХроноГрафа", "Уроков", "Предметы / курсы ВД в МЭШ по приоритету (двойной щелчок)", "Групп МЭШ", "Состояние"]
     problem_col = 5
     COL_ON, COL_NAME, COL_N, COL_MESH, COL_GROUPS, COL_STATUS = range(6)
 
@@ -303,7 +295,7 @@ class SubjectsTab(EntityTab):
         ctx, name = self.ctx, self.key_at(row)
         on = self.table.item(row, self.COL_ON).checkState() == Qt.Checked
         cur = ctx.m.subjects.get(name) or []
-        self.table.item(row, self.COL_MESH).setText("; ".join(f"{n} (ВД)" if n in ctx.ec_only else n for n in cur))
+        self.table.item(row, self.COL_MESH).setText(" → ".join(f"{n} (ВД)" if n in ctx.ec_only else n for n in cur))
         n_oo = sum(ctx.groups_per_subject.get(n, 0) for n in cur)
         n_ec = sum(ctx.ec_groups_per_subject.get(n, 0) for n in cur)
         self.table.item(row, self.COL_GROUPS).setText(f"{n_oo}" + (f" + {n_ec} ВД" if n_ec else "") if cur else "")
@@ -346,7 +338,10 @@ class SubjectsTab(EntityTab):
                    for lab, v in options]
         dlg = CheckListDialog(f"Предмет «{name}» — предметы и курсы МЭШ", options, ctx.m.subjects.get(name) or [], self,
                               "Отметьте названия предметов МЭШ (и курсов внеурочной деятельности), среди групп которых "
-                              "искать группу для этого предмета. Обычные группы имеют приоритет над группами ВД.")
+                              "искать группу для этого предмета. Порядок — приоритет: уроки недели ставятся в группу "
+                              "первого названия, пока не исчерпаны её часы по нагрузке учителя, затем — второго и т. д. "
+                              "(например, «Информатика → Технология»). В пределах названия обычные группы имеют "
+                              "приоритет над группами ВД.", ordered=True)
         if dlg.exec():
             ctx.m.subjects[name] = dlg.values() or None
             self._filling = True
@@ -490,64 +485,86 @@ class RoomsTab(EntityTab):
 
 # ---------------------------------------------------------------------- группы
 class GroupsTab(EntityTab):
-    headers = ["Класс", "Предмет", "Гр.", "Учитель", "Ур.", "Состояние", "Группа МЭШ", "Задать вручную", "Как выбрана"]
-    problem_col = 5
-    COL_CLS, COL_SUBJ, COL_GRP, COL_TEACHER, COL_N, COL_STATUS, COL_MESH, COL_MANUAL, COL_WHY = range(9)
-
-    def setup_table(self):
-        self.table.setItemDelegateForColumn(self.COL_MANUAL, ChoiceDelegate(self._choices, self.table))
-        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed)
-
-    def _choices(self, row: int):
-        l = self.table.item(row, 0).data(Qt.UserRole)
-        return self.ctx.group_choices(l.cls, l.subject)
+    """Строка на каждую классогруппу и каждый приоритет её предмета (название МЭШ, по которому в классе
+    есть группы): уроки недели заполняют группу 1-го приоритета до её часов, затем 2-го и т. д."""
+    headers = ["Класс", "Предмет", "Гр.", "Прио.", "Учитель", "Ур./нед", "Часов/нед", "Состояние", "Группа МЭШ",
+               "Задано вручную (двойной щелчок)", "Как выбрана"]
+    problem_col = 7
+    COL_CLS, COL_SUBJ, COL_GRP, COL_PRIO, COL_TEACHER, COL_N, COL_HOURS, COL_STATUS, COL_MESH, COL_MANUAL, COL_WHY = range(11)
 
     def fill_rows(self, ctx: Ctx):
         lessons = relevant_lessons(ctx.tt, ctx.m)
         seen: dict[str, chngf.Lesson] = {}
-        count: Counter = Counter()
+        per_week: Counter = Counter()          # (ключ, неделя цикла) → уроков
         for l in lessons:
             key = group_key(l)
             seen.setdefault(key, l)
-            count[key] += 1
+            per_week[(key, l.week)] += 1
         self._rows_by_clsgrp: dict[int, list[int]] = defaultdict(list)
+        self._resolver = GroupResolver(ctx.tt, ctx.rd, ctx.m)
+        weeks = range(max(1, ctx.tt.week_count))
         for key, l in seen.items():
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            self._rows_by_clsgrp[l.clsgrp_index].append(r)
-            self.table.setItem(r, self.COL_CLS, cell(l.cls, l))
-            self.table.setItem(r, self.COL_SUBJ, cell(l.subject))
-            self.table.setItem(r, self.COL_GRP, cell(l.group or ""))
-            self.table.setItem(r, self.COL_TEACHER, cell(l.teacher))
-            self.table.setItem(r, self.COL_N, cell(count[key]))
-            for c in (self.COL_STATUS, self.COL_MESH, self.COL_WHY):
-                self.table.setItem(r, c, cell(""))
-            self.table.setItem(r, self.COL_MANUAL, cell("", editable=True))
-        self._kinds = [("ok", False)] * len(seen)      # по строкам: (ok | weak | bad, группа ВД)
-        self.refresh_rows(range(len(seen)))
+            n_les = max(per_week[(key, w)] for w in weeks)
+            for link in self._resolver.resolve_chain(l):
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self._rows_by_clsgrp[l.clsgrp_index].append(r)
+                self.table.setItem(r, self.COL_CLS, cell(l.cls, l))
+                self.table.setItem(r, self.COL_SUBJ, cell(l.subject))
+                self.table.setItem(r, self.COL_GRP, cell(l.group or ""))
+                prio = cell(link.prio, link.prio)
+                prio.setToolTip(f"приоритет {link.prio}: {link.name or '—'}")
+                self.table.setItem(r, self.COL_PRIO, prio)
+                self.table.setItem(r, self.COL_TEACHER, cell(l.teacher))
+                self.table.setItem(r, self.COL_N, cell(n_les, n_les))
+                for c in (self.COL_HOURS, self.COL_STATUS, self.COL_MESH, self.COL_MANUAL, self.COL_WHY):
+                    self.table.setItem(r, c, cell(""))
+        self._kinds = [("ok", False)] * self.table.rowCount()      # по строкам: (ok | weak | over | bad, группа ВД)
+        self.refresh_rows(range(self.table.rowCount()))
+
+    def prio_at(self, row: int) -> int:
+        return self.table.item(row, self.COL_PRIO).data(Qt.UserRole)
 
     def refresh_rows(self, rows: Iterable[int]) -> list[int]:
         """Заново выбрать группу МЭШ в строках ``rows``, переписав только изменившиеся ячейки
         (таблица не перестраивается — прокрутка, выделение и ширина столбцов остаются).
         Возвращает номера изменившихся строк."""
         ctx, m = self.ctx, self.ctx.m
-        resolver = GroupResolver(ctx.tt, ctx.rd, m)
+        resolver = self._resolver = GroupResolver(ctx.tt, ctx.rd, m)
         changed = []
         was_filling, self._filling = self._filling, True
         try:
             for r in rows:
-                l = self.key_at(r)
-                g, why = resolver.resolve(l)
-                explicit = m.groups.get(group_key(l))
+                l, prio = self.key_at(r), self.prio_at(r)
+                chain = resolver.resolve_chain(l)
+                link = next((lk for lk in chain if lk.prio == prio), None)
+                if link is None:               # звено исчезло (снят ручной выбор по названию без групп) — до перезаполнения
+                    continue
+                g, why = link.group, link.why
+                explicit = m.groups.get(group_key(l, prio))
                 eg = ctx.rd.any_group(explicit) if explicit else None
+                tid = resolver.teacher_id(l)
+                hours = ctx.rd.group_hours_span(g, tid) if g else ""
+                n_les = self.table.item(r, self.COL_N).data(Qt.UserRole)
+                group_teachers = [t.get("id") for t in (g or {}).get("teachers") or []]
                 if g is None:
                     kind, status, color = "bad", _short_reason(why), COLOR_BAD
                 elif "проверьте" in why:
                     kind, status, color = "weak", "проверьте", COLOR_WARN
+                elif group_teachers and (tid if tid is not None else (group_teachers[0] if len(group_teachers) == 1 else None)) not in group_teachers:
+                    # план такую группу пропустит: сервер принимает только учителя, привязанного к группе
+                    kind, status, color = "weak", "учитель не привязан к группе МЭШ", COLOR_WARN
                 else:
                     kind, status, color = "ok", "", None
+                    if prio == 1 and hours and n_les > min(_hours_range(hours)):
+                        rest = [lk for lk in chain[1:] if lk.group]
+                        if rest:
+                            why += f"; часов меньше уроков — остальные по приоритету {', '.join(str(lk.prio) for lk in rest)}"
+                        else:
+                            kind, status, color = "over", "уроков больше часов группы — лишние встанут сверх часов", COLOR_WARN
                 self._kinds[r] = (kind, is_ec(g))
-                touched = self._put(r, self.COL_MESH, ctx.group_short(g) if g else "", tip=ctx.group_label(g) if g else "")
+                touched = self._put(r, self.COL_HOURS, hours, tip="часов в неделю по нагрузке учителя в МЭШ" if hours else "нет данных о нагрузке")
+                touched |= self._put(r, self.COL_MESH, ctx.group_short(g) if g else "", tip=ctx.group_label(g) if g else "")
                 touched |= self._put(r, self.COL_WHY, why, tip=why)
                 touched |= self._put(r, self.COL_MANUAL, ctx.group_short(eg) if eg else (f"id {explicit}" if explicit else ""),
                                      explicit, tip=ctx.group_label(eg) if eg else "")
@@ -570,22 +587,67 @@ class GroupsTab(EntityTab):
         it.setToolTip(tip)
         return True
 
-    def on_item_changed(self, row, col, item) -> bool:
-        if col != self.COL_MANUAL:
-            return False
-        l = self.key_at(row)
-        value = item.data(Qt.UserRole)
+    def on_double_clicked(self, row, col):
+        ctx, l, prio = self.ctx, self.key_at(row), self.prio_at(row)
+        cu_id = ctx.class_unit_id(l.cls)
+        if cu_id is None:
+            info(self, "Группа МЭШ", f"Класс «{l.cls}» не сопоставлен с классом МЭШ — сначала задайте его на вкладке «Классы».")
+            return
+        names = ctx.m.subjects.get(l.subject) or []
+        name = names[prio - 1] if prio <= len(names) else ""
+        key = group_key(l, prio)
+        # кому ещё эта группа назначена вручную — чтобы не отдать одну группу двум подгруппам по ошибке
+        taken: dict[int, list[str]] = defaultdict(list)
+        for k, gid in ctx.m.groups.items():
+            if gid and k != key:
+                c, sub, grp, p = split_group_key(k)
+                taken[gid].append(f"{c} {sub}" + (f"/{grp}" if grp and grp != "0" else "") + (f" (прио. {p})" if p > 1 else ""))
+        tid = self._resolver.teacher_id(l)
+        rows = []
+        for g in list(ctx.rd.groups_by_class.get(cu_id, [])) + list(ctx.rd.ec_groups_by_class.get(cu_id, [])):
+            rows.append(([g.get("name") or "", g.get("subject_name") or "", ctx._teachers(g), ctx.rd.group_hours_span(g, tid),
+                          len(g.get("student_ids") or []), "ВД" if is_ec(g) else "",
+                          "; ".join(taken.get(g["id"], [])), g["id"]],
+                         g["id"], g.get("subject_name") == name if name else g.get("subject_name") in names))
+        auto = self.table.item(row, self.COL_MESH).text()
+        why = self.table.item(row, self.COL_WHY).text()
+        hint = (f"Занятие: {l.cls}, {l.subject}" + (f"/{l.group}" if l.group else "") + f", учитель {l.teacher or '—'}"
+                + (f"; приоритет {prio} — «{name}»" if len(names) > 1 else "") + ". "
+                + (f"Сейчас выбрана автоматически: {auto} ({why})." if auto else f"Автоматически группа не выбрана: {why or '—'}.")
+                + " Выберите группу МЭШ из списка (двойной щелчок) или нажмите «Автоматически», чтобы убрать ручной выбор."
+                + ("" if names else " Предмет не сопоставлен — список не отфильтрован по предмету."))
+        dlg = PickDialog(f"Группа МЭШ для {l.cls} — {l.subject}" + (f"/{l.group}" if l.group else "")
+                         + (f", приоритет {prio}" if len(names) > 1 else ""),
+                         ["Группа", "Предмет", "Учителя", "Часов/нед", "Учеников", "ВД", "Уже задана вручную для", "id"],
+                         rows, ctx.m.groups.get(key), self, hint, auto_label="Автоматически", only_fit_label="только по предмету")
+        res = dlg.exec()
+        if not res:
+            return
+        value = None if dlg.is_auto() else dlg.value()
+        if value == ctx.m.groups.get(key):
+            return
         if value is None:
-            self.ctx.m.groups.pop(group_key(l), None)
+            ctx.m.groups.pop(key, None)
         else:
-            self.ctx.m.groups[group_key(l)] = value
+            ctx.m.groups[key] = value
+        n_before = len(self._resolver.resolve_chain(l))
         # от выбора зависят ещё строки идентичных подгрупп (GroupResolver подбирает им группу по составу
         # учеников уже сопоставленных) — пересчитываем их, остальные строки не трогаем
-        identical = GroupResolver(self.ctx.tt, self.ctx.rd, self.ctx.m).identical.get(l.clsgrp_index, ())
-        rows = [row] + [r for i in sorted(identical) for r in self._rows_by_clsgrp.get(i, ()) if r != row]
-        if self.refresh_rows(rows) and (self.search.text().strip() or self.only_problems.isChecked()):
+        identical = self._resolver.identical.get(l.clsgrp_index, ())
+        rows_ = list(self._rows_by_clsgrp.get(l.clsgrp_index, ())) + \
+                [r for i in sorted(identical) for r in self._rows_by_clsgrp.get(i, ())]
+        changed = self.refresh_rows(rows_)
+        if len(self._resolver.resolve_chain(l)) != n_before:
+            self.fill(ctx)                     # число звеньев изменилось — строки перестраиваем целиком
+        elif changed and (self.search.text().strip() or self.only_problems.isChecked()):
             self.apply_filter()                # состояние строк изменилось — фильтр «только проблемы» мог устареть
-        return True
+        self.owner.mapping_edited(groups_stale=False)
+
+
+def _hours_range(span: str) -> tuple[int, int]:
+    """«1» → (1, 1), «1–2» → (1, 2)."""
+    lo, _, hi = span.partition("–")
+    return int(lo), int(hi or lo)
 
 
 # ---------------------------------------------------------------------- настройки
@@ -764,6 +826,8 @@ class MappingTab(QWidget):
                         (self.rooms, "Кабинеты"), (self.groups, "Группы"), (self.settings, "Настройки")):
             self.tabs.addTab(w, name)
         lay.addWidget(self.tabs, 1)
+        self._groups_stale = False
+        self.tabs.currentChanged.connect(self._tab_changed)
         self.state.changed.connect(self._on_changed)
         self.refresh()
 
@@ -779,6 +843,7 @@ class MappingTab(QWidget):
         ctx = Ctx(st.tt, st.rd, st.m) if ok else None
         for tab in (self.classes, self.subjects, self.teachers, self.rooms, self.groups):
             tab.fill(ctx)
+        self._groups_stale = False
         self.settings.fill(st.m)
         self.auto_btn.setEnabled(ok)
         self.update_summary(why)
@@ -801,18 +866,27 @@ class MappingTab(QWidget):
             f"учителя {sum(1 for t in used_teachers if m.teachers.get(t) in st.rd.teacher_by_id and not st.rd.teacher_deleted(m.teachers.get(t)))}"
             f"/{len(used_teachers)} · "
             f"кабинеты {sum(1 for r in used_rooms if m.rooms.get(r) in st.rd.room_by_id)}/{len(used_rooms)} · "
-            f"группы {gs['ok'] + gs['weak']}/{gs['ok'] + gs['weak'] + gs['bad']} (ВД {gs['ec']}, проверить {gs['weak']})"
+            f"группы {gs['ok'] + gs['weak'] + gs['over']}/{gs['ok'] + gs['weak'] + gs['over'] + gs['bad']} (ВД {gs['ec']}, проверить {gs['weak']}"
+            + (f", уроков больше часов {gs['over']}" if gs['over'] else "") + ")"
             + ("   — есть несохранённые изменения" if st.mapping_dirty else ""))
 
-    def mapping_edited(self, reindex: bool = False):
+    def mapping_edited(self, reindex: bool = False, groups_stale: bool = True):
         st = self.state
         st.mark_mapping_dirty()
         if reindex and st.rd is not None:
             st.rd._index(st.m.ec_course_suffix)
             self.refresh()
             return
+        # выбор групп зависит от классов, предметов и учителей — вкладку «Группы» перестроим при её открытии
+        self._groups_stale = self._groups_stale or groups_stale
         self.update_summary()
         self.app.update_title()
+
+    def _tab_changed(self, index: int):
+        if self.tabs.widget(index) is self.groups and self._groups_stale and self.groups.ctx is not None:
+            self._groups_stale = False
+            self.groups.fill(self.groups.ctx)
+            self.update_summary()
 
     def save(self):
         try:

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import auth, paths, refdata
+from ..mesh_api import fmt_roles
 from .common import error, info, scrollable
 
 
@@ -221,7 +222,7 @@ class SetupTab(QWidget):
         def job(progress, message):
             client = st.get_client()
             p = client.teacher_profile()
-            return (f"{st.session_text}; сотрудник {p.get('name')} (id {p.get('id')}), роли {p.get('roles')}; "
+            return (f"{st.session_text}; сотрудник {p.get('name')} (id {p.get('id')}), роли {fmt_roles(p.get('roles'))}; "
                     + auth.describe(st.paths["token_file"] or None))
 
         def done(text):

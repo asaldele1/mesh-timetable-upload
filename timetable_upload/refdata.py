@@ -120,8 +120,14 @@ class RefData:
         self.teachers = [t for t in self.teacher_profiles if not t.get("deleted")]
         self.bells_by_id = {b["id"]: b for b in self.bells_timetables}
         self.groups_by_class: dict[int, list] = {}
+        # нагрузка учителей по неделям (teacher_loads): группа → учитель → неделя → часов
+        self.loads_by_group: dict[int, dict[int, dict[int, int]]] = {}
         for g in self.groups:
             g["teachers"] = [t for t in g.get("teachers") or [] if not self.teacher_deleted(t.get("id"))]
+            for t in g["teachers"]:
+                for ld in t.get("teacher_loads") or []:
+                    if ld.get("week_number") is not None and ld.get("hours") is not None:
+                        self.loads_by_group.setdefault(g["id"], {}).setdefault(t["id"], {})[ld["week_number"]] = ld["hours"]
             ids = set(g.get("class_unit_ids") or [])
             if g.get("class_unit_id"):
                 ids.add(g["class_unit_id"])
@@ -148,6 +154,27 @@ class RefData:
             for cu in cus:
                 self.ec_groups_by_class.setdefault(cu, []).append(g)
         self.ec_course_names = sorted({g["subject_name"] for g in self.ec_group_by_id.values() if g["subject_name"]})
+
+    def group_hours(self, g: dict, week: int, teacher_id: int | None = None) -> int | None:
+        """Часов группы на неделе по нагрузке учителей (teacher_loads): нагрузка учителя занятия, а если
+        у него записи нет — сумма по всем учителям группы.  None — данных нет (группы ВД, группы без
+        нагрузки): лимит часов не проверяется."""
+        loads = self.loads_by_group.get(g["id"])
+        if not loads:
+            return None
+        if teacher_id in loads and week in loads[teacher_id]:
+            return loads[teacher_id][week]
+        vals = [w[week] for w in loads.values() if week in w]
+        return sum(vals) if vals else None
+
+    def group_hours_span(self, g: dict, teacher_id: int | None = None) -> str:
+        """Часы группы в неделю по неделям года, где они есть (нули — каникулы и недели без нагрузки —
+        не учитываются): «1» или «1–2»; «0» — нагрузки нет ни на одной неделе; «» — данных нет."""
+        vals = {h for wk in self.schedule_by_week if (h := self.group_hours(g, wk, teacher_id)) is not None}
+        if not vals:
+            return ""
+        vals = vals - {0} or {0}
+        return str(min(vals)) if len(vals) == 1 else f"{min(vals)}–{max(vals)}"
 
     def check_academic_year(self, client: MeshClient) -> None:
         """Кэш должен относиться к учебному году сессии: id недель, групп и звонков в разных годах разные,

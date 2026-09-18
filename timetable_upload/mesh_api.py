@@ -59,6 +59,13 @@ class Session:
 MAX_WORKERS = 16     # верхняя граница числа параллельных запросов (размер пула соединений)
 
 
+def fmt_roles(roles: Any) -> str:
+    """Роли из teacher_profile (список строк) — через запятую, без скобок и кавычек."""
+    if isinstance(roles, (list, tuple, set)):
+        return ", ".join(str(r) for r in roles) or "—"
+    return str(roles) if roles else "—"
+
+
 class MeshClient:
     """Клиент API МЭШ. Один экземпляр можно использовать из нескольких потоков одновременно
     (см. ``workers`` в uploader): пул соединений общий, пауза ``delay`` — общая на всех,

@@ -180,6 +180,8 @@ class PlannedItem:
     begin_time: str = ""        # только для ВД: время по звонку класса
     end_time: str = ""
     duration: str = ""          # «00:45»
+    priority: int = 1           # приоритет названия предмета МЭШ, по которому выбрана группа (см. build_plan)
+    over_hours: bool = False    # часы группы на неделе исчерпаны у всех приоритетов — поставлено сверх часов
 
     @property
     def key(self) -> tuple[str, int, str, int | str]:
@@ -193,7 +195,8 @@ class PlannedItem:
         return (f"{l.cls} {DAYS[l.day]} {l.lesson + 1}: {l.subject}{('/' + str(l.group)) if l.group else ''} — "
                 f"{l.teacher or '—'} [{l.cabinet or '—'}] → {'группа ВД' if self.kind == 'ec' else 'группа'} "
                 f"{self.group_id} «{self.group_name}», учитель {self.teacher_id or '—'}, "
-                f"кабинет {self.room_id or '—'}, {slot}, {self.date}")
+                f"кабинет {self.room_id or '—'}, {slot}, {self.date}"
+                + (f" [приоритет {self.priority}]" if self.priority > 1 else "") + (" [сверх часов]" if self.over_hours else ""))
 
 
 @dataclass
@@ -223,9 +226,12 @@ class Plan:
             lo, hi = min(self.dates), max(self.dates)
             span = f", {lo}" + (f" — {hi}" if hi != lo else "") + (f" ({len(self.dates)} дн.)" if len(self.dates) < 7 else "")
         cycle = f", {self.cycle_week + 1}-я неделя цикла" if self.cycle_weeks > 1 else ""
+        n_prio = sum(1 for p in self.items if p.priority > 1)
+        n_over = sum(1 for p in self.items if p.over_hours)
         s = [f"неделя {self.week}{span}{cycle} (schedule_id {self.schedule_id}, ВД {self.ec_schedule_id or 'не создано'}): "
-             f"занятий к переносу {len(self.items)} (уроков {len(self.items) - n_ec}, ВД {n_ec}), "
-             f"пропущено {len(self.skipped)}"]
+             f"занятий к переносу {len(self.items)} (уроков {len(self.items) - n_ec}, ВД {n_ec}"
+             + (f", по 2-му и далее приоритету предмета {n_prio}" if n_prio else "")
+             + (f", сверх часов группы {n_over}" if n_over else "") + f"), пропущено {len(self.skipped)}"]
         for r, n in reasons.most_common():
             s.append(f"    пропуск — {r}: {n}")
         if self.existing or self.to_create or self.to_delete:
@@ -254,9 +260,19 @@ def default_room(rd: RefData, teacher_id: int | None, building_id: int | None) -
 
 
 def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
-               week1_monday: _dt.date, sel: Selection | None = None) -> Plan:
+               week1_monday: _dt.date, sel: Selection | None = None,
+               existing: list[dict] | None = None, replace: bool = False) -> Plan:
     """План на неделю МЭШ.  Для файла с циклом из нескольких недель берётся неделя цикла по номеру
-    недели МЭШ: неделя 1 — первая неделя цикла, 2 — вторая и т. д. по кругу."""
+    недели МЭШ: неделя 1 — первая неделя цикла, 2 — вторая и т. д. по кругу.
+
+    Предмету может соответствовать несколько групп МЭШ по приоритету (см. ``GroupResolver.resolve_chain``):
+    уроки недели по порядку (пн 1-й урок → сб последний) идут в группу 1-го приоритета, пока не исчерпаны
+    её часы на неделе по нагрузке учителя, затем — 2-го и т. д.; если часы исчерпаны у всех, урок встаёт
+    в группу 1-го приоритета сверх часов.  Часы считаются по всей неделе, даже когда план ограничен датами
+    или видом занятий.  ``existing`` — занятия недели на сервере (``fetch_existing``): те из них, что
+    останутся после загрузки (все при ``replace=False``; при ``replace=True`` — вне дат плана), тоже
+    занимают часы своих групп.
+    """
     sel = sel or Selection()
     sched = rd.schedule_by_week.get(week)
     if not sched:
@@ -272,48 +288,95 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
     if sel.classes is not None:
         wanted = set(sel.classes)
         lessons = [l for l in lessons if l.cls in wanted]
-    lessons = [l for l in lessons if l.week == plan.cycle_week and monday + _dt.timedelta(days=l.day) in plan.dates]
+    # вся неделя цикла в хронологическом порядке: часы групп считаются по всей неделе, а не по выбранным датам
+    lessons = sorted((l for l in lessons if l.week == plan.cycle_week), key=lambda l: (l.day, l.lesson))
+    sel_cu_ids = {cu["id"] for l in lessons if (cu := rd.class_unit(m.classes.get(l.cls) or "")) is not None}
+    # часы, уже занятые на сервере занятиями, которые останутся; их ключи — чтобы не считать их дважды,
+    # когда план попадает в тот же слот
+    used: Counter = Counter()
+    on_server: set[tuple] = set()
+    for it in existing or []:
+        k = _item_key(it)
+        our = _dt.date.fromisoformat(k[2]) in plan.dates and (plan.only is None or k[0] == plan.only)
+        if replace and our and (cus := _item_classes(it, rd)) and cus <= sel_cu_ids:
+            continue                   # будет удалено (или совпадёт с планом и посчитается при постановке)
+        on_server.add(k)
+        used[k[1]] += 1
     bells_cache: dict[tuple[int, _dt.date], dict | None] = {}
     resolver = GroupResolver(tt, rd, m)
+
+    def in_scope(date: _dt.date, kind: str | None = None) -> bool:
+        return date in plan.dates and (kind is None or sel.only is None or kind == sel.only)
+
+    def skip(l: chngf.Lesson, date: _dt.date, why: str, kind: str | None = None) -> None:
+        if in_scope(date, kind):
+            plan.skipped.append((l, why))
+
     for l in lessons:
+        date = monday + _dt.timedelta(days=l.day)
         cu_name = m.classes.get(l.cls)
         cu = rd.class_unit(cu_name) if cu_name else None
         if not cu:
-            plan.skipped.append((l, "класс не сопоставлен"))
+            skip(l, date, "класс не сопоставлен")
             continue
         teacher_id = m.teachers.get(l.teacher) if l.teacher else None
         if teacher_id is not None and rd.teacher_deleted(teacher_id):    # сервер удалённый профиль не примет
-            plan.skipped.append((l, f"учитель удалён в МЭШ: {rd.teacher_by_id[teacher_id].get('name')} (id {teacher_id})"))
+            skip(l, date, f"учитель удалён в МЭШ: {rd.teacher_by_id[teacher_id].get('name')} (id {teacher_id})")
             continue
-        g, why = resolver.resolve(l)
-        if not g:
-            plan.skipped.append((l, f"группа не найдена: {why}"))
+        chain = resolver.resolve_chain(l)
+        if chain[0].group is None:
+            skip(l, date, f"группа не найдена: {chain[0].why}")
             continue
-        group_teachers = [t["id"] for t in g.get("teachers") or [] if t.get("id")]
-        if teacher_id is None:
-            if len(group_teachers) == 1:
-                teacher_id = group_teachers[0]
-                why += "; учитель взят из группы"
-            else:
-                plan.skipped.append((l, "учитель не сопоставлен"))
-                continue
-        # сервер принимает только учителя, привязанного к группе (удалённые из списка группы уже убраны)
-        if group_teachers and teacher_id not in group_teachers:
-            names = [t.get("full_name") for t in g.get("teachers") or []]
-            plan.skipped.append((l, f"учитель не привязан к группе МЭШ: в группе «{g['name']}» — {names}"))
-            continue
-        date = monday + _dt.timedelta(days=l.day)
         if (cu["id"], date) not in bells_cache:
             bells_cache[(cu["id"], date)] = rd.bells_timetable_for(cu["id"], date)
         bt = bells_cache[(cu["id"], date)]
         if not bt:
-            plan.skipped.append((l, "нет расписания звонков: классу не назначено расписание звонков на эту дату"))
+            skip(l, date, "нет расписания звонков: классу не назначено расписание звонков на эту дату")
             continue
         bell = rd.bell_for(bt, l.day + 1, l.lesson + 1)
         if not bell:
-            plan.skipped.append((l, f"нет звонка: урок {l.lesson + 1} отсутствует в расписании звонков «{bt.get('name')}» "
-                                    f"({DAYS[l.day]}: уроки {rd.lesson_numbers(bt, l.day + 1)})"))
+            skip(l, date, f"нет звонка: урок {l.lesson + 1} отсутствует в расписании звонков «{bt.get('name')}» "
+                          f"({DAYS[l.day]}: уроки {rd.lesson_numbers(bt, l.day + 1)})")
             continue
+        begin, end = bell.get("begin_time") or "", bell.get("end_time") or ""
+        # выбор звена: первое, у которого учитель привязан к группе и есть часы (или занятие уже стоит на
+        # сервере); если часы исчерпаны у всех — первое подходящее по учителю, сверх часов
+        chosen = fallback = None
+        not_attached, exhausted = [], []
+        for link in chain:
+            g = link.group
+            if g is None:
+                continue
+            group_teachers = [t["id"] for t in g.get("teachers") or [] if t.get("id")]
+            tid, why = teacher_id, link.why
+            if tid is None and len(group_teachers) == 1:
+                tid, why = group_teachers[0], why + "; учитель взят из группы"
+            # сервер принимает только учителя, привязанного к группе (удалённые из списка группы уже убраны)
+            if (group_teachers and tid not in group_teachers) or tid is None:
+                names = ", ".join(t.get("full_name") or "?" for t in g.get("teachers") or []) or "—"
+                not_attached.append(f"«{g['name']}» — {names}")
+                continue
+            key = ("ec", g["id"], date.isoformat(), begin) if is_ec(g) else ("oo", g["id"], date.isoformat(), bell["id"])
+            cap = rd.group_hours(g, week, tid)
+            if key in on_server or cap is None or used[g["id"]] < cap:
+                chosen = (link, tid, why, key)
+                break
+            fallback = fallback or (link, tid, why, key)
+            exhausted.append(f"«{g['name']}» ({cap} ч)")
+        if chosen is None and fallback is None:
+            if not_attached:
+                skip(l, date, ("учитель не сопоставлен" if teacher_id is None else "учитель не привязан к группе МЭШ")
+                     + ": в группе " + "; ".join(not_attached))
+            else:
+                skip(l, date, "группа не найдена: " + "; ".join(lk.why for lk in chain if lk.group is None))
+            continue
+        over_hours = chosen is None
+        link, teacher_id, why, key = chosen or fallback
+        g = link.group
+        if over_hours:
+            why += f"; сверх часов: на неделе исчерпаны {', '.join(exhausted)}"
+        elif link.prio > 1:
+            why += f"; приоритет {link.prio} «{link.name}»: на неделе исчерпаны {', '.join(exhausted)}"
         room_id = m.rooms.get(l.cabinet) if l.cabinet else None
         room_guessed = False
         if room_id:
@@ -328,30 +391,46 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
             # иначе первый кабинет этого здания.  Это догадка: с кабинетом на сервере не сравнивается
             room_id, building_id = default_room(rd, teacher_id, bt.get("building_id"))
             if room_id is None:
-                plan.skipped.append((l, "нет кабинета: не сопоставлен и не удалось подобрать по умолчанию"))
+                skip(l, date, "нет кабинета: не сопоставлен и не удалось подобрать по умолчанию", "oo")
                 continue
             room_guessed = True
             why += ("; кабинет не сопоставлен" if l.cabinet else "; кабинет не задан") + \
                    f" — подставлен «{rd.room_by_id[room_id].get('name')}»"
         item = PlannedItem(l, date, cu["id"], cu["name"], g["id"], g["name"], bell["id"],
-                           teacher_id, room_id, building_id, why, room_guessed)
+                           teacher_id, room_id, building_id, why, room_guessed,
+                           priority=link.prio, over_hours=over_hours)
         if is_ec(g):
             # занятие ВД задаётся временем, а не звонком: берём границы звонка класса
-            begin, end = bell.get("begin_time") or "", bell.get("end_time") or ""
             minutes = _minutes(end) - _minutes(begin) if begin and end else 0
             if minutes not in m.ec_durations:
-                plan.skipped.append((l, f"длительность звонка не подходит для ВД: {begin}–{end} ({minutes} мин; "
-                                        f"допустимо {'/'.join(map(str, m.ec_durations))})"))
+                skip(l, date, f"длительность звонка не подходит для ВД: {begin}–{end} ({minutes} мин; "
+                              f"допустимо {'/'.join(map(str, m.ec_durations))})", "ec")
                 continue
             item.kind, item.begin_time, item.end_time, item.duration = "ec", begin, end, f"00:{minutes:02d}"
-        if sel.only and item.kind != sel.only:
-            continue
         if item.key in seen:
             # поток: несколько классов ведут на одну метагруппу — одно занятие
             continue
         seen[item.key] = item
+        if item.key not in on_server:      # занятие с сервера в этом слоте уже посчитано
+            used[g["id"]] += 1
+        if not in_scope(date, item.kind):
+            continue
         plan.items.append(item)
         plan.class_unit_ids.add(cu["id"])
+    return plan
+
+
+def plan_week(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int, week1_monday: _dt.date,
+              sel: Selection | None = None, client: MeshClient | None = None, replace: bool = False) -> Plan:
+    """План недели; с ``client`` — сверенный с сервером (``diff_plan``), причём занятия, которые на
+    сервере останутся, учтены в часах групп."""
+    plan = build_plan(tt, rd, m, week, week1_monday, sel)
+    if client is None:
+        return plan
+    existing = fetch_existing(client, plan)
+    if existing:
+        plan = build_plan(tt, rd, m, week, week1_monday, sel, existing, replace)
+    diff_plan(plan, existing, replace, rd)
     return plan
 
 

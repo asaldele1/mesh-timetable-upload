@@ -74,10 +74,10 @@ class Mapping:
     def save(self, path) -> None:
         d = {"_help": [
             "classes: класс ХроноГрафа → название класса в МЭШ (null — не сопоставлен).",
-            "subjects: предмет ХроноГрафа → список названий предметов МЭШ или курсов внеурочной деятельности, среди групп которых искать (null — не сопоставлен); обычные группы имеют приоритет над группами ВД.",
+            "subjects: предмет ХроноГрафа → список названий предметов МЭШ или курсов внеурочной деятельности в порядке приоритета (null — не сопоставлен): уроки недели ставятся в группу первого названия, пока не исчерпаны её часы по нагрузке учителя, затем — второго и т. д.; в пределах названия обычные группы имеют приоритет над группами ВД.",
             "teachers: ФИО учителя из ХроноГрафа → id профиля учителя в МЭШ.",
             "rooms: кабинет ХроноГрафа → id кабинета в МЭШ.  room_prefixes: префикс кабинета → id здания (для автоподбора).",
-            "groups: 'класс|предмет|номер группы' → id группы МЭШ (обычной или внеурочной деятельности); заполняется только там, где автоматика не справилась, но можно задать и вручную.",
+            "groups: 'класс|предмет|номер группы' → id группы МЭШ (обычной или внеурочной деятельности) для первого приоритета, 'класс|предмет|номер группы|2' — для второго и т. д.; заполняется только там, где автоматика не справилась, но можно задать и вручную.",
             "ignore_subjects / ignore_classes: что не переносить.",
             "subject_synonyms: нормализованное название предмета ХроноГрафа (строчные буквы, без знаков препинания) → названия предметов/курсов МЭШ, которые подставляются при автосопоставлении.",
             "ec_durations: допустимые длительности занятия ВД в минутах; ec_course_suffix: regex хвоста с классами в названии курса ВД; group_ordinal_suffix: regex номера подгруппы («… 2гр») в названии группы МЭШ.",
@@ -191,7 +191,7 @@ def _match_classes(tt, rd, m, rep):
         else:
             m.classes.setdefault(cls.name, None)
             cands = difflib.get_close_matches(norm_class(cls.name), list(rd.class_unit_by_name), n=3, cutoff=0.6)
-            rep.problem(f"  класс {cls.name!r}: не найден в МЭШ" + (f"; похожие: {cands}" if cands else "")
+            rep.problem(f"  класс {cls.name!r}: не найден в МЭШ" + (f"; похожие: {', '.join(cands)}" if cands else "")
                         + ("  (в кэше есть классы только части параллелей?)" if len(rd.class_units) < 20 else ""))
     ok = sum(1 for v in m.classes.values() if v)
     rep.add(f"  сопоставлено {ok} из {len([c for c in tt.classes if c.name not in m.ignore_classes])}")
@@ -211,7 +211,7 @@ def _match_subjects(lessons, rd, m, rep):
         if cur:
             missing = [x for x in cur if x not in mesh_names]
             if missing:
-                rep.problem(f"  предмет {name!r}: в сопоставлении указаны названия, которых нет среди групп МЭШ: {missing}")
+                rep.problem(f"  предмет {name!r}: в сопоставлении указаны названия, которых нет среди групп МЭШ: {', '.join(missing)}")
             if n in by_norm and by_norm[n] not in cur:
                 # точное совпадение вне списка (например, новый курс ВД): список задан пользователем и мог быть
                 # сужен намеренно — только подсказываем, сами не дописываем
@@ -226,7 +226,7 @@ def _match_subjects(lessons, rd, m, rep):
         if found:
             m.subjects[name] = found
             if all(f in ec_only for f in found):
-                rep.add(f"  предмет {name!r} ({cnt} уроков) → курс ВД {found}")
+                rep.add(f"  предмет {name!r} ({cnt} уроков) → курс ВД {', '.join(found)}")
             continue
         m.subjects.setdefault(name, None)
         sugg = difflib.get_close_matches(n, list(by_norm), n=4, cutoff=0.5)
@@ -236,7 +236,7 @@ def _match_subjects(lessons, rd, m, rep):
             if any(w in mn for w in words) and mn not in sugg:
                 sugg.append(mn)
         variants = [by_norm[x] + (" (ВД)" if by_norm[x] in ec_only else "") for x in sugg[:6]]
-        rep.problem(f"  предмет {name!r} ({cnt} уроков): не сопоставлен; варианты: {variants}")
+        rep.problem(f"  предмет {name!r} ({cnt} уроков): не сопоставлен; варианты: {', '.join(variants)}")
     ok = sum(1 for k, v in m.subjects.items() if v and k in used)
     rep.add(f"  сопоставлено {ok} из {len([s for s in used if s not in m.ignore_subjects])}")
 
@@ -288,7 +288,7 @@ def _match_teachers(tt, lessons, rd, m, rep):
             sugg = [f"{c['name']} (id {c['id']})" for k in close for c in by_last[k]]
         else:
             sugg = [f"{c['name']} (id {c['id']})" for c in cands]
-        rep.problem(f"  учитель {name!r}: {'не найден' if not cands else 'несколько кандидатов'}; варианты: {sugg}")
+        rep.problem(f"  учитель {name!r}: {'не найден' if not cands else 'несколько кандидатов'}; варианты: {', '.join(sugg)}")
     ok = sum(1 for t in tt.teachers if t.index in used_teachers and m.teachers.get(t.name))
     rep.add(f"  сопоставлено {ok} из {total}")
 
@@ -347,7 +347,7 @@ def _match_rooms(lessons, rd, m, rep):
         m.room_prefixes.setdefault(pfx, None)
         sc = scores(pfx)
         if sc:
-            rep.problem(f"  префикс {pfx!r}: здание не определено однозначно, совпадения по зданиям: {dict(sc)}")
+            rep.problem(f"  префикс {pfx!r}: здание не определено однозначно, совпадения по зданиям: {', '.join(f"{b}: {n}" for b, n in sc.items())}")
         else:
             rep.problem(f"  префикс {pfx!r}: ни один номер не совпал с кабинетами МЭШ")
     for name, cnt in sorted(used.items(), key=lambda x: -x[1]):
@@ -366,13 +366,22 @@ def _match_rooms(lessons, rd, m, rep):
         names = {f"{r['number']} / {r['name']} (здание {r['building_id']}, id {r['id']})": norm_text(f"{r['number']} {r['name']}") for r in rooms}
         sugg = difflib.get_close_matches(rn.text, list(names.values()), n=4, cutoff=0.4)
         sugg_txt = [k for k, v in names.items() if v in sugg][:4]
-        rep.problem(f"  кабинет {name!r} ({cnt} уроков): не сопоставлен; варианты: {sugg_txt}")
+        rep.problem(f"  кабинет {name!r} ({cnt} уроков): не сопоставлен; варианты: {', '.join(sugg_txt)}")
     ok = sum(1 for k in used if m.rooms.get(k))
     rep.add(f"  сопоставлено {ok} из {len(used)}")
 
 
-def group_key(l: chngf.Lesson) -> str:
-    return f"{l.cls}|{l.subject}|{l.group}"
+def group_key(l: chngf.Lesson, prio: int = 1) -> str:
+    """Ключ ручного сопоставления группы: «класс|предмет|номер группы», для 2-го и следующих
+    приоритетов предмета — с хвостом «|2», «|3»…"""
+    return f"{l.cls}|{l.subject}|{l.group}" + (f"|{prio}" if prio > 1 else "")
+
+
+def split_group_key(key: str) -> tuple[str, str, str, int]:
+    """(класс, предмет, номер группы, приоритет) из ключа ``groups``."""
+    parts = key.split("|")
+    prio = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
+    return parts[0], parts[1], parts[2] if len(parts) > 2 else "", prio
 
 
 def _group_ordinal(g: dict, suffix_re: str) -> int:
@@ -380,36 +389,40 @@ def _group_ordinal(g: dict, suffix_re: str) -> int:
     return int(m.group(1)) if m and m.lastindex and m.group(1).isdigit() else 1
 
 
-def group_candidates(l: chngf.Lesson, rd: RefData, m: Mapping) -> tuple[list[dict], str]:
+def group_candidates(l: chngf.Lesson, rd: RefData, m: Mapping,
+                     subj_names: list[str] | None = None) -> tuple[list[dict], str]:
     """Группы МЭШ класса по предмету занятия: обычные группы, а если их нет — группы внеурочной
-    деятельности.  Возвращает (кандидаты, причина отсутствия)."""
+    деятельности.  ``subj_names`` — названия предметов МЭШ, среди групп которых искать (по умолчанию
+    все из сопоставления предмета).  Возвращает (кандидаты, причина отсутствия)."""
     cu_name = m.classes.get(l.cls)
     cu = rd.class_unit(cu_name) if cu_name else None
     if not cu:
         return [], "класс не сопоставлен"
-    subj_names = m.subjects.get(l.subject) or []
+    if subj_names is None:
+        subj_names = m.subjects.get(l.subject) or []
     if not subj_names:
         return [], "предмет не сопоставлен"
     for pool in (rd.groups_by_class, rd.ec_groups_by_class):
         cands = [g for g in pool.get(cu["id"], []) if g.get("subject_name") in subj_names]
         if cands:
             return cands, ""
-    return [], f"в классе {cu['name']} нет групп (ни обычных, ни ВД) по предметам {subj_names}"
+    return [], f"в классе {cu['name']} нет групп (ни обычных, ни ВД) по предметам {', '.join(subj_names)}"
 
 
 def is_ec(g: dict | None) -> bool:
     return bool(g) and g.get("kind") == "ec"
 
 
-def _resolve(l: chngf.Lesson, rd: RefData, m: Mapping, teacher_id: int | None) -> tuple[dict | None, str, list[dict]]:
+def _resolve(l: chngf.Lesson, rd: RefData, m: Mapping, teacher_id: int | None,
+             prio: int = 1, subj_names: list[str] | None = None) -> tuple[dict | None, str, list[dict]]:
     """(группа, пояснение, оставшиеся кандидаты): кандидаты непусты только при неоднозначности —
     по ним дальше выбирает :class:`GroupResolver`."""
-    key = group_key(l)
+    key = group_key(l, prio)
     explicit = m.groups.get(key)
     if explicit:
         g = rd.any_group(explicit)
         return (g, "по явному сопоставлению", []) if g else (None, f"группа id {explicit} из сопоставления не найдена в кэше", [])
-    cands, why = group_candidates(l, rd, m)
+    cands, why = group_candidates(l, rd, m, subj_names)
     if not cands:
         return None, why, []
     if len(cands) == 1:
@@ -435,7 +448,7 @@ def _resolve(l: chngf.Lesson, rd: RefData, m: Mapping, teacher_id: int | None) -
             return by_teacher[0], "по учителю", []
         if len(by_teacher) > 1:
             cands = by_teacher
-    return (None, "несколько групп: " + "; ".join(f"{g['name']} (id {g['id']}, учителя: {[t.get('full_name') for t in g.get('teachers') or []]})" for g in cands),
+    return (None, "несколько групп: " + "; ".join(f"{g['name']} (id {g['id']}, учителя: {', '.join(t.get('full_name') or '?' for t in g.get('teachers') or []) or '—'})" for g in cands),
             cands)
 
 
@@ -443,6 +456,16 @@ def resolve_group(l: chngf.Lesson, rd: RefData, m: Mapping, teacher_id: int | No
     """Находит группу МЭШ для занятия; возвращает (группа, пояснение)."""
     g, why, _ = _resolve(l, rd, m, teacher_id)
     return g, why
+
+
+@dataclass
+class Link:
+    """Звено цепочки приоритетов: название предмета МЭШ и подобранная по нему группа (или причина,
+    почему не подобрана)."""
+    prio: int
+    name: str
+    group: dict | None
+    why: str
 
 
 class GroupResolver:
@@ -454,6 +477,10 @@ class GroupResolver:
     состоит из тех же учеников, что «Английский/1», а та уже сопоставлена с
     группой МЭШ, берётся кандидат с наибольшим пересечением по ученикам.
     Последний довод — номер подгруппы в названии группы МЭШ.
+
+    Предмету ХроноГрафа может соответствовать несколько названий МЭШ по приоритету
+    (``Mapping.subjects``): :meth:`resolve_chain` подбирает группу по каждому названию отдельно,
+    и план недели заполняет группу 1-го приоритета до её часов, затем 2-го и т. д.
     """
 
     def __init__(self, tt: chngf.Timetable, rd: RefData, m: Mapping):
@@ -464,22 +491,43 @@ class GroupResolver:
             idx = {by_key[k] for k in grp if k in by_key}
             for i in idx:
                 self.identical[i] = idx - {i}
-        self._cache: dict[int, tuple[dict | None, str]] = {}
+        self._cache: dict[int, list[Link]] = {}
 
     def teacher_id(self, l: chngf.Lesson) -> int | None:
         return self.m.teachers.get(l.teacher) if l.teacher else None
 
     def resolve(self, l: chngf.Lesson) -> tuple[dict | None, str]:
+        """Группа 1-го приоритета (и пояснение) — как в отчёте и на вкладке «Группы»."""
+        first = self.resolve_chain(l)[0]
+        return first.group, first.why
+
+    def resolve_chain(self, l: chngf.Lesson) -> list[Link]:
+        """Звенья по названиям предметов МЭШ из сопоставления, в порядке приоритета.  Названия, по
+        которым в классе нет ни одной группы, пропускаются (если только не задана группа вручную);
+        первое звено есть всегда — при полной неудаче оно несёт причину."""
         if l.clsgrp_index in self._cache:
             return self._cache[l.clsgrp_index]
-        g, why, cands = _resolve(l, self.rd, self.m, self.teacher_id(l))
+        names = self.m.subjects.get(l.subject) or []
+        chain: list[Link] = []
+        for prio, name in enumerate(names, 1):
+            if not self.m.groups.get(group_key(l, prio)) and not group_candidates(l, self.rd, self.m, [name])[0]:
+                continue
+            g, why = self._resolve_one(l, prio, [name])
+            chain.append(Link(prio, name, g, why))
+        if not chain:
+            g, why = self._resolve_one(l, 1, None)
+            chain.append(Link(1, names[0] if names else "", g, why))
+        self._cache[l.clsgrp_index] = chain
+        return chain
+
+    def _resolve_one(self, l: chngf.Lesson, prio: int, subj_names: list[str] | None) -> tuple[dict | None, str]:
+        g, why, cands = _resolve(l, self.rd, self.m, self.teacher_id(l), prio, subj_names)
         if g is None and cands and l.clsgrp_index in self.identical:
             g2, why2 = self._by_students(l, cands)
             if g2 is not None:
                 g, why = g2, why2
         if g is None and cands and l.group > 0:
             g, why = self._by_ordinal(l, cands, why)
-        self._cache[l.clsgrp_index] = (g, why)
         return g, why
 
     def _by_students(self, l: chngf.Lesson, cands: list[dict]) -> tuple[dict | None, str]:
@@ -523,21 +571,46 @@ class GroupResolver:
 def _match_groups(tt, lessons, rd, m, rep):
     rep.add("== Группы (класс|предмет|группа → группа МЭШ) ==")
     seen: dict[str, chngf.Lesson] = {}
+    per_week: Counter = Counter()          # (ключ, неделя цикла) → уроков
     for l in lessons:
         seen.setdefault(group_key(l), l)
-    n_ok = n_weak = n_ec = 0
+        per_week[(group_key(l), l.week)] += 1
+    n_ok = n_weak = n_ec = n_spill = n_over = 0
     resolver = GroupResolver(tt, rd, m)
     for key, l in seen.items():
-        g, why = resolver.resolve(l)
+        chain = resolver.resolve_chain(l)
+        g, why = chain[0].group, chain[0].why
         if g:
             n_ok += 1
             n_ec += is_ec(g)
             if "проверьте" in why:
                 n_weak += 1
                 rep.add(f"  {key} → {'ВД ' if is_ec(g) else ''}{g['name']} (id {g['id']}) — {why}")
+        elif why not in ("класс не сопоставлен", "предмет не сопоставлен"):      # иначе уже отражено выше
+            m.groups.setdefault(key, None)
+            rep.problem(f"  {key} (учитель {l.teacher!r}): {why}")
+        for link in chain[1:]:
+            if link.group is None:
+                m.groups.setdefault(group_key(l, link.prio), None)
+                rep.problem(f"  {key}, приоритет {link.prio} «{link.name}» (учитель {l.teacher!r}): {link.why}")
+        # хватит ли часов группе 1-го приоритета: иначе лишние уроки уйдут по следующим приоритетам
+        # или встанут сверх часов
+        if g is None:
             continue
-        if why in ("класс не сопоставлен", "предмет не сопоставлен"):
-            continue          # уже отражено выше
-        m.groups.setdefault(key, None)
-        rep.problem(f"  {key} (учитель {l.teacher!r}): {why}")
-    rep.add(f"  сопоставлено {n_ok} из {len(seen)} (из них группы ВД: {n_ec}; по номеру группы, требуют проверки: {n_weak})")
+        n_les = max(per_week[(key, w)] for w in range(max(1, tt.week_count)))
+        # нули (каникулы, недели без нагрузки) не показательны — сравниваем с наименьшей ненулевой нагрузкой
+        hours = [h for wk in rd.schedule_by_week if (h := rd.group_hours(g, wk, resolver.teacher_id(l)))]
+        if not hours or n_les <= min(hours):
+            continue
+        rest = [lk for lk in chain[1:] if lk.group]
+        if rest:
+            n_spill += 1
+            rep.add(f"  {key}: уроков в неделю {n_les}, часов у «{g['name']}» {min(hours)} — "
+                    f"остальные пойдут в {', '.join(f'«{lk.group['name']}»' for lk in rest)}")
+        else:
+            n_over += 1
+            rep.add(f"  {key}: уроков в неделю {n_les}, часов у «{g['name']}» {min(hours)} — лишние встанут сверх часов "
+                    "(при необходимости добавьте предмету второе название МЭШ)")
+    rep.add(f"  сопоставлено {n_ok} из {len(seen)} (из них группы ВД: {n_ec}; по номеру группы, требуют проверки: {n_weak}"
+            + (f"; уроков больше часов группы: с переносом в следующий приоритет {n_spill}, сверх часов {n_over}"
+               if n_spill or n_over else "") + ")")

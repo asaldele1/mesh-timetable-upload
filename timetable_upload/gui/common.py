@@ -8,9 +8,10 @@ import traceback
 from collections.abc import Callable
 
 from PySide6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QCompleter,
     QDialog,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -324,12 +326,19 @@ class ChoiceDelegate(QStyledItemDelegate):
 
 
 class CheckListDialog(QDialog):
-    """Выбор нескольких значений из списка с фильтром по подстроке."""
+    """Выбор нескольких значений из списка с фильтром по подстроке.
 
-    def __init__(self, title: str, options: list[tuple[str, object]], checked: list, parent=None, hint: str = ""):
+    ``ordered=True`` — порядок отмеченных имеет значение (приоритет): они нумеруются, вновь отмеченный
+    встаёт в конец, кнопки «Выше»/«Ниже» переставляют; ``values()`` возвращает их в этом порядке.
+    """
+
+    def __init__(self, title: str, options: list[tuple[str, object]], checked: list, parent=None, hint: str = "",
+                 ordered: bool = False):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(520, 560)
+        self.ordered = ordered
+        self._busy = False
         lay = QVBoxLayout(self)
         if hint:
             lab = QLabel(hint)
@@ -340,11 +349,15 @@ class CheckListDialog(QDialog):
         self.filter.textChanged.connect(self._apply_filter)
         lay.addWidget(self.filter)
         self.list = QListWidget()
+        checked = list(checked)
         checked_set = set(checked)
-        # отмеченные — сверху
-        for label, value in sorted(options, key=lambda o: (o[1] not in checked_set, o[0].lower())):
+        # отмеченные — сверху (в упорядоченном режиме — в порядке приоритета)
+        for label, value in sorted(options, key=lambda o: (o[1] not in checked_set,
+                                                           checked.index(o[1]) if ordered and o[1] in checked_set else 0,
+                                                           o[0].lower())):
             it = QListWidgetItem(label)
             it.setData(Qt.UserRole, value)
+            it.setData(Qt.UserRole + 1, label)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(Qt.Checked if value in checked_set else Qt.Unchecked)
             self.list.addItem(it)
@@ -353,6 +366,14 @@ class CheckListDialog(QDialog):
         clear = QPushButton("Снять все")
         clear.clicked.connect(self._clear)
         row.addWidget(clear)
+        if ordered:
+            up, down = QPushButton("Выше"), QPushButton("Ниже")
+            up.clicked.connect(lambda: self._move(-1))
+            down.clicked.connect(lambda: self._move(1))
+            row.addWidget(up)
+            row.addWidget(down)
+            self.list.itemChanged.connect(self._on_changed)
+            self._renumber()
         row.addStretch()
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
@@ -367,12 +388,172 @@ class CheckListDialog(QDialog):
             it.setHidden(bool(needle) and needle not in it.text().lower() and it.checkState() != Qt.Checked)
 
     def _clear(self):
-        for i in range(self.list.count()):
-            self.list.item(i).setCheckState(Qt.Unchecked)
+        self._busy = True
+        try:
+            for i in range(self.list.count()):
+                self.list.item(i).setCheckState(Qt.Unchecked)
+        finally:
+            self._busy = False
+        if self.ordered:
+            self._renumber()
+
+    def _checked_rows(self) -> list[int]:
+        return [i for i in range(self.list.count()) if self.list.item(i).checkState() == Qt.Checked]
+
+    def _on_changed(self, it):
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            if it.checkState() == Qt.Checked:
+                # вновь отмеченный — в конец отмеченных
+                row = self.list.row(it)
+                target = max((i for i in self._checked_rows() if i != row), default=-1) + 1
+                if target > row:
+                    target -= 1
+                if target != row:
+                    self.list.insertItem(target, self.list.takeItem(row))
+                    self.list.setCurrentItem(it)
+            self._renumber()
+        finally:
+            self._busy = False
+
+    def _move(self, d: int):
+        it = self.list.currentItem()
+        if it is None or it.checkState() != Qt.Checked:
+            return
+        row = self.list.row(it)
+        target = row + d
+        if not (0 <= target < self.list.count()) or self.list.item(target).checkState() != Qt.Checked:
+            return
+        self._busy = True
+        try:
+            self.list.insertItem(target, self.list.takeItem(row))
+            self.list.setCurrentItem(it)
+            self._renumber()
+        finally:
+            self._busy = False
+
+    def _renumber(self):
+        was, self._busy = self._busy, True         # setText тоже испускает itemChanged
+        try:
+            n = 0
+            for i in range(self.list.count()):
+                it = self.list.item(i)
+                label = it.data(Qt.UserRole + 1)
+                if it.checkState() == Qt.Checked:
+                    n += 1
+                    it.setText(f"{n}. {label}")
+                else:
+                    it.setText(label)
+        finally:
+            self._busy = was
 
     def values(self) -> list:
         return [self.list.item(i).data(Qt.UserRole) for i in range(self.list.count())
                 if self.list.item(i).checkState() == Qt.Checked]
+
+
+class PickDialog(QDialog):
+    """Выбор одного значения из таблицы с поиском по подстроке.
+
+    ``rows`` — список ``(ячейки, значение, подходит)``: строки с ``подходит=False`` показываются
+    серым, ниже подходящих, и скрываются переключателем «только подходящие».  Кнопка ``auto_label``
+    (если задана) закрывает диалог с ``value() is None`` — «сбросить на автоматический выбор».
+    """
+
+    def __init__(self, title: str, headers: list[str], rows: list[tuple[list[str], object, bool]], current,
+                 parent=None, hint: str = "", auto_label: str = "", only_fit_label: str = "только подходящие"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(900, 560)
+        self._value = current
+        lay = QVBoxLayout(self)
+        if hint:
+            lab = QLabel(hint)
+            lab.setWordWrap(True)
+            lay.addWidget(lab)
+        top = QHBoxLayout()
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("поиск…")
+        self.filter.textChanged.connect(self._apply_filter)
+        top.addWidget(self.filter, 1)
+        n_fit = sum(1 for _, _, fit in rows if fit)
+        self.only_fit = QCheckBox(f"{only_fit_label} ({n_fit})")
+        self.only_fit.setChecked(0 < n_fit < len(rows))
+        self.only_fit.setEnabled(0 < n_fit < len(rows))
+        self.only_fit.toggled.connect(self._apply_filter)
+        top.addWidget(self.only_fit)
+        lay.addLayout(top)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(headers)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree.setAllColumnsShowFocus(True)
+        grey = QBrush(QColor("#808080"))
+        bold = QFont()
+        bold.setBold(True)
+        current_item = None
+        for cells, value, fit in sorted(rows, key=lambda r: not r[2]):
+            it = QTreeWidgetItem([str(c) for c in cells])
+            it.setData(0, Qt.UserRole, value)
+            it.setData(0, Qt.UserRole + 1, fit)
+            if not fit:
+                for c in range(len(cells)):
+                    it.setForeground(c, grey)
+            if current is not None and value == current:
+                it.setFont(0, bold)
+                current_item = it
+            self.tree.addTopLevelItem(it)
+        for c in range(len(headers)):
+            self.tree.resizeColumnToContents(c)
+        self.tree.itemDoubleClicked.connect(lambda *_: self.accept())
+        self.tree.itemActivated.connect(lambda *_: self.accept())
+        lay.addWidget(self.tree, 1)
+        row = QHBoxLayout()
+        if auto_label:
+            auto = QPushButton(auto_label)
+            auto.clicked.connect(self._auto)
+            row.addWidget(auto)
+        row.addStretch()
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        lay.addLayout(row)
+        self._apply_filter()
+        if current_item is not None:
+            self.tree.setCurrentItem(current_item)
+            self.tree.scrollToItem(current_item)
+        self.filter.setFocus()
+
+    def _apply_filter(self, *_):
+        needle = self.filter.text().strip().lower()
+        only_fit = self.only_fit.isChecked()
+        for i in range(self.tree.topLevelItemCount()):
+            it = self.tree.topLevelItem(i)
+            text = " ".join(it.text(c) for c in range(it.columnCount())).lower()
+            hide = (bool(needle) and needle not in text) or (only_fit and not it.data(0, Qt.UserRole + 1))
+            it.setHidden(hide and it.data(0, Qt.UserRole) != self._value)
+
+    def _auto(self):
+        self._value = None
+        self.tree.clearSelection()
+        self.done(QDialog.Accepted + 1)       # отличается от Accepted: вызывающий проверяет is_auto()
+
+    def accept(self):
+        it = self.tree.currentItem()
+        if it is None or it.isHidden():
+            return
+        self._value = it.data(0, Qt.UserRole)
+        super().accept()
+
+    def is_auto(self) -> bool:
+        return self.result() == QDialog.Accepted + 1
+
+    def value(self):
+        return self._value
 
 
 def ask(parent: QWidget, title: str, text: str, danger: bool = False) -> bool:

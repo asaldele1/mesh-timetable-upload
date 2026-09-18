@@ -12,7 +12,7 @@ from dataclasses import asdict
 
 from . import auth, chngf, export, paths, refdata, uploader
 from .mapping import Mapping, match_all
-from .mesh_api import MAX_WORKERS, MeshClient, MeshError
+from .mesh_api import MAX_WORKERS, MeshClient, MeshError, fmt_roles
 from .uploader import DAYS, Journal
 
 TOKEN_ENV = auth.TOKEN_ENV
@@ -134,7 +134,7 @@ def cmd_check_auth(args):
     print("Учебный год:", json.dumps(s.academic_year, ensure_ascii=False))
     print("Все учебные годы:", ", ".join(f"{y.get('name')} (id {y.get('id')})" for y in client.academic_years()))
     p = client.teacher_profile()
-    print(f"Профиль сотрудника: {p.get('name')} (id {p.get('id')}), роли {p.get('roles')}")
+    print(f"Профиль сотрудника: {p.get('name')} (id {p.get('id')}), роли {fmt_roles(p.get('roles'))}")
 
 
 def cmd_fetch(args):
@@ -219,9 +219,7 @@ def cmd_plan(args):
     sel = selection(args, tt)
     plans = []
     for week in weeks_for(args, sel, w1):
-        plan = uploader.build_plan(tt, rd, m, week, w1, sel)
-        if client:
-            uploader.diff_plan(plan, uploader.fetch_existing(client, plan), args.replace, rd)
+        plan = uploader.plan_week(tt, rd, m, week, w1, sel, client, args.replace)
         _print_plan(plan, args.verbose)
         plans.append(plan)
     if args.export:
@@ -237,8 +235,7 @@ def cmd_upload(args):
     total_err = 0
     sel = selection(args, tt)
     for week in weeks_for(args, sel, w1):
-        plan = uploader.build_plan(tt, rd, m, week, w1, sel)
-        uploader.diff_plan(plan, uploader.fetch_existing(client, plan), args.replace, rd)
+        plan = uploader.plan_week(tt, rd, m, week, w1, sel, client, args.replace)
         _print_plan(plan, args.verbose)
         if not args.apply:
             print("  (пробный прогон; добавьте --apply, чтобы применить)")

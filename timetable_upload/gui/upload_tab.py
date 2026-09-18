@@ -356,11 +356,9 @@ class UploadTab(QWidget):
             for i, week in enumerate(weeks):
                 if self.app.stop_requested():
                     return None
-                plan = uploader.build_plan(tt, rd, m, week, w1, sel)
                 if client:
                     message(f"неделя {week}: запрос занятий с сервера…")
-                    uploader.diff_plan(plan, uploader.fetch_existing(client, plan), replace, rd)
-                plans.append(plan)
+                plans.append(uploader.plan_week(tt, rd, m, week, w1, sel, client, replace))
                 progress(i + 1, len(weeks))
             return plans
 

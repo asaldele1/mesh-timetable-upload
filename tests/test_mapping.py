@@ -400,3 +400,125 @@ def test_deleted_teachers_are_filtered():
     rep = mapping.MatchReport()
     mapping._match_teachers(tt, list(tt.iter_lessons()), rd, m, rep)
     assert m.teachers["Лебедева Анна Сергеевна"] == 100 and any("удалён в МЭШ" in s for s in rep.lines)
+
+
+# ---------------------------------------------------------------- приоритеты предметов и часы групп
+def _rd_prio(hours=1):
+    """К _rd() добавлены группы 11-В по информатике, технологии (учитель Лебедева, по ``hours`` ч/нед)
+    и труду (другой учитель)."""
+    rd = _rd()
+
+    def loads(h):
+        return [{"week_number": w, "hours": h, "real_hours": 0} for w in (16, 17)] if h is not None else []
+
+    rd.groups += [
+        {"id": 20, "name": "Информатика 11-В 11в", "subject_name": "Информатика", "class_unit_id": 1, "class_unit_ids": [1],
+         "is_metagroup": False, "teachers": [{"id": 100, "full_name": "Лебедева", "teacher_loads": loads(hours)}]},
+        {"id": 21, "name": "Технология 11-В 11в", "subject_name": "Технология", "class_unit_id": 1, "class_unit_ids": [1],
+         "is_metagroup": False, "teachers": [{"id": 100, "full_name": "Лебедева", "teacher_loads": loads(hours)}]},
+        {"id": 22, "name": "Труд 11-В 11в", "subject_name": "Труд", "class_unit_id": 1, "class_unit_ids": [1],
+         "is_metagroup": False, "teachers": [{"id": 101, "full_name": "Зайцева", "teacher_loads": loads(hours)}]},
+    ]
+    rd.schedules.append({"id": 901, "week_number": 17})
+    rd._index()
+    return rd
+
+
+def _m_prio(names=("Информатика", "Технология", "Труд", "Химия"), **groups):
+    return Mapping(classes={"11в": "11-В"}, subjects={"Информатика": list(names)},
+                   teachers={"Лебедева А.С.": 100, "Зайцева Мария Игоревна": 101}, groups=dict(groups))
+
+
+def _inf(day, lesson=0, teacher="Лебедева А.С."):
+    return _lesson("11в", "Информатика", 0, teacher, day=day, lesson=lesson)
+
+
+def test_group_key_priority():
+    l = _inf(0)
+    assert mapping.group_key(l) == "11в|Информатика|0" and mapping.group_key(l, 2) == "11в|Информатика|0|2"
+    assert mapping.split_group_key("11в|Информатика|0") == ("11в", "Информатика", "0", 1)
+    assert mapping.split_group_key("11в|Информатика|1|3") == ("11в", "Информатика", "1", 3)
+
+
+def test_resolve_chain_by_priority():
+    rd = _rd_prio()
+    chain = mapping.GroupResolver(_timetable([]), rd, _m_prio()).resolve_chain(_inf(0))
+    # «Химия» пропущена — в классе нет групп; остальные — по порядку списка
+    assert [(lk.prio, lk.name, lk.group["id"]) for lk in chain] == [(1, "Информатика", 20), (2, "Технология", 21), (3, "Труд", 22)]
+    assert rd.group_hours(rd.group_by_id[20], 16, 100) == 1 and rd.group_hours(rd.group_by_id[20], 16, 999) == 1
+    assert rd.group_hours(rd.group_by_id[20], 40) is None and rd.group_hours(rd.ec_group_by_id[600], 16) is None
+    assert rd.group_hours_span(rd.group_by_id[20]) == "1" and rd.group_hours_span(rd.ec_group_by_id[600]) == ""
+    # ручной выбор по приоритету: «|2» — второе звено; первое звено — без суффикса, как раньше
+    m = _m_prio(**{"11в|Информатика|0|2": 22, "11в|Информатика|0": 21})
+    chain = mapping.GroupResolver(_timetable([]), rd, m).resolve_chain(_inf(0))
+    assert [(lk.prio, lk.group["id"], lk.why) for lk in chain[:2]] == [(1, 21, "по явному сопоставлению"), (2, 22, "по явному сопоставлению")]
+    # ничего не подобрано — единственное звено с причиной
+    chain = mapping.GroupResolver(_timetable([]), rd, _m_prio(names=("Химия",))).resolve_chain(_inf(0))
+    assert len(chain) == 1 and chain[0].group is None and "нет групп" in chain[0].why
+
+
+def test_build_plan_spills_by_hours():
+    rd = _rd_prio()
+    lessons = [_inf(0), _inf(1), _inf(2)]
+    plan = uploader.build_plan(_timetable(lessons), rd, _m_prio(), 16, datetime.date(2025, 9, 1))
+    got = [(p.group_id, p.priority, p.over_hours) for p in plan.items]
+    # пн — информатика (1 ч), вт — технология (2-й приоритет), ср — труд не подходит по учителю → информатика сверх часов
+    assert got == [(20, 1, False), (21, 2, False), (20, 1, True)] and plan.skipped == []
+    assert "приоритет 2 «Технология»" in plan.items[1].note and "исчерпаны «Информатика 11-В 11в» (1 ч)" in plan.items[1].note
+    assert "сверх часов" in plan.items[2].note and "[сверх часов]" in plan.items[2].describe()
+    assert "по 2-му и далее приоритету предмета 1" in plan.summary() and "сверх часов группы 1" in plan.summary()
+    # часов нет в справочнике — лимита нет, всё в первый приоритет
+    plan = uploader.build_plan(_timetable(lessons), _rd_prio(hours=None), _m_prio(), 16, datetime.date(2025, 9, 1))
+    assert [(p.group_id, p.priority) for p in plan.items] == [(20, 1)] * 3
+    # часы считаются по всей неделе, даже если план ограничен одной датой
+    sel = uploader.Selection(dates={datetime.date(2025, 12, 17)})
+    plan = uploader.build_plan(_timetable(lessons), rd, _m_prio(), 16, datetime.date(2025, 9, 1), sel)
+    assert [(p.group_id, p.over_hours) for p in plan.items] == [(20, True)] and plan.skipped == []
+    # учитель не привязан ни к одной группе цепочки — пропуск с перечнем групп
+    plan = uploader.build_plan(_timetable([_inf(0, teacher="Зайцева Мария Игоревна")]), rd,
+                               _m_prio(names=("Информатика", "Технология")), 16, datetime.date(2025, 9, 1))
+    assert plan.items == [] and "не привязан" in plan.skipped[0][1] and "«Технология 11-В 11в»" in plan.skipped[0][1]
+
+
+def test_build_plan_counts_existing_lessons():
+    rd = _rd_prio()
+    lessons = [_inf(0), _inf(1), _inf(2)]
+    tt = _timetable(lessons)
+    m = _m_prio(names=("Информатика", "Технология"))
+    thu = {"id": 5, "group_id": 20, "date": [2025, 12, 18], "bell_id": 7003, "teacher_id": 100, "room_id": 500, "class_unit_id": 1}
+    # без replace чужой урок информатики в четверг остаётся и съедает единственный час
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1), existing=[thu], replace=False)
+    assert [(p.group_id, p.over_hours) for p in plan.items] == [(21, False), (20, True), (20, True)]
+    # с replace он будет удалён — часы свободны
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1), existing=[thu], replace=True)
+    assert [(p.group_id, p.over_hours) for p in plan.items] == [(20, False), (21, False), (20, True)]
+    # а если план только на среду, четверг вне дат плана и остаётся даже с replace
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1), uploader.Selection(dates={datetime.date(2025, 12, 17)}),
+                               existing=[thu], replace=True)
+    assert [(p.group_id, p.over_hours) for p in plan.items] == [(20, True)]
+    # занятия сервера в тех же слотах, что и план, не считаются дважды: план их подтверждает как есть
+    same = [{"id": 6, "group_id": 20, "date": [2025, 12, 15], "bell_id": 7001, "teacher_id": 100, "room_id": 500, "class_unit_id": 1},
+            {"id": 7, "group_id": 21, "date": [2025, 12, 16], "bell_id": 7001, "teacher_id": 100, "room_id": 500, "class_unit_id": 1}]
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1), existing=same, replace=False)
+    assert [(p.group_id, p.priority, p.over_hours) for p in plan.items] == [(20, 1, False), (21, 2, False), (20, 1, True)]
+    uploader.diff_plan(plan, same, replace=False, rd=rd)
+    assert plan.unchanged == 2 and len(plan.to_create) == 1
+
+
+def test_match_groups_reports_hours():
+    rd = _rd_prio()
+    lessons = [_inf(0), _inf(1)]
+    m = _m_prio(names=("Информатика", "Технология"))
+    rep = mapping.MatchReport()
+    mapping._match_groups(_timetable(lessons), lessons, rd, m, rep)
+    assert any("уроков в неделю 2, часов у «Информатика 11-В 11в» 1 — остальные пойдут в «Технология 11-В 11в»" in x for x in rep.lines)
+    m = _m_prio(names=("Информатика",))
+    rep = mapping.MatchReport()
+    mapping._match_groups(_timetable(lessons), lessons, rd, m, rep)
+    assert any("сверх часов" in x for x in rep.lines)
+    # неразрешённое звено второго приоритета — проблема с ключом «|2»
+    m = _m_prio(names=("Информатика", "Труд"))
+    m.groups["11в|Информатика|0|2"] = 999999
+    rep = mapping.MatchReport()
+    mapping._match_groups(_timetable(lessons), lessons, rd, m, rep)
+    assert any("приоритет 2 «Труд»" in x and "не найдена в кэше" in x for x in rep.lines)

@@ -11,7 +11,7 @@ import os
 from .uploader import DAYS, ApplyResult, Plan, PlannedItem, describe_existing, item_kind
 
 PLAN_COLUMNS = ["Неделя", "Дата", "Действие", "Класс", "День", "Урок", "Предмет", "Группа", "Учитель", "Кабинет",
-                "Вид", "Группа МЭШ", "id группы", "id учителя", "id кабинета", "Звонок / время", "Примечание"]
+                "Вид", "Группа МЭШ", "Приоритет", "id группы", "id учителя", "id кабинета", "Звонок / время", "Примечание"]
 ERROR_COLUMNS = ["Неделя", "Занятие", "Ошибка"]
 
 
@@ -19,7 +19,8 @@ def _planned_row(plan: Plan, action: str, p: PlannedItem, note: str = "") -> lis
     l = p.lesson
     slot = f"{p.begin_time}–{p.end_time}" if p.kind == "ec" else p.bell_id
     return [plan.week, p.date.isoformat(), action, l.cls, DAYS[l.day], l.lesson + 1, l.subject, l.group or "",
-            l.teacher or "", l.cabinet or "", "ВД" if p.kind == "ec" else "урок", p.group_name, p.group_id,
+            l.teacher or "", l.cabinet or "", "ВД" if p.kind == "ec" else "урок", p.group_name,
+            f"{p.priority}" + (" (сверх часов)" if p.over_hours else ""), p.group_id,
             p.teacher_id or "", p.room_id or "", slot, "; ".join(x for x in (note, p.note) if x)]
 
 
@@ -29,7 +30,7 @@ def _existing_row(plan: Plan, action: str, it: dict) -> list:
     d = it.get("date")
     date = f"{d[0]:04d}-{d[1]:02d}-{d[2]:02d}" if isinstance(d, list) else str(d or "")[:10]
     return [plan.week, date, action, it.get("class_unit_name") or "", "", it.get("lesson_number") or "", "", "", "", "",
-            "ВД" if ec else "урок", it.get("ec_group_name" if ec else "group_name") or "",
+            "ВД" if ec else "урок", it.get("ec_group_name" if ec else "group_name") or "", "",
             it.get("ec_group_id" if ec else "group_id") or "", it.get("teacher_id") or "", it.get("room_id") or "",
             f"{it.get('begin_time')}–{it.get('end_time')}" if ec else it.get("bell_id") or "",
             f"на сервере: учитель {it.get('teacher_name') or '—'}, кабинет {it.get('room_name') or it.get('room_id') or '—'}; id {it.get('id')}"]
@@ -49,7 +50,7 @@ def plan_rows(plans: list[Plan]) -> list[list]:
             rows += [_planned_row(plan, "к переносу", p) for p in plan.items]
         for l, r in plan.skipped:
             rows.append([plan.week, "", "пропущено", l.cls, DAYS[l.day], l.lesson + 1, l.subject, l.group or "",
-                         l.teacher or "", l.cabinet or "", "", "", "", "", "", "", r])
+                         l.teacher or "", l.cabinet or "", "", "", "", "", "", "", "", r])
     return rows
 
 
