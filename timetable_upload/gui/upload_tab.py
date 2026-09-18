@@ -241,11 +241,12 @@ class UploadTab(QWidget):
         def job(progress, message):
             client = st.get_client_for_refdata()
             out = {}
+            ec_by_week = {x["week_number"]: x for x in client.ec_schedules()}   # id недель ВД в кэше могли устареть
             for i, wk in enumerate(weeks):
                 if self.app.stop_requested():
                     break
                 items = client.schedule_items(wk, cu_ids)
-                ec = rd.ec_schedule_by_week.get(wk)
+                ec = ec_by_week.get(wk)
                 ec_items = client.ec_schedule_items(ec["id"], cu_ids) if ec else []
                 out[wk] = (len(items), len({it.get("class_unit_id") for it in items}), len(ec_items))
                 progress(i + 1, len(weeks))

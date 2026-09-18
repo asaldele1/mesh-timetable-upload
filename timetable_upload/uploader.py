@@ -505,12 +505,32 @@ def diff_plan(plan: Plan, existing: list[dict], replace: bool, rd: RefData) -> N
                 plan.to_delete.append(it)
 
 
+def sync_ec_schedule(client: MeshClient, plan: Plan) -> None:
+    """Берёт id расписания ВД недели с сервера, а не из кэша справочников.
+
+    Сайт пересоздаёт расписания недель ВД — id меняется, и занятие, созданное по устаревшему id, попадает
+    в «висящее» расписание: в сетке недели его не видно, но учитель, кабинет и ученики им заняты, а
+    выборка занятий по актуальному расписанию его не находит (удалить такое можно только по журналу).
+    """
+    live = [s for s in client.ec_schedules() or [] if s.get("week_number") == plan.week
+            and s.get("academic_year_id") in (None, client.ay)]
+    new_id = max(s["id"] for s in live) if live else None
+    if len(live) > 1:
+        log.warning("расписаний ВД недели %s на сервере несколько: %s — берём %s",
+                    plan.week, ", ".join(str(s["id"]) for s in live), new_id)
+    if new_id != plan.ec_schedule_id:
+        log.warning("расписание ВД недели %s: на сервере id %s, в кэше справочников %s — используем серверный",
+                    plan.week, new_id, plan.ec_schedule_id)
+    plan.ec_schedule_id = new_id
+
+
 def fetch_existing(client: MeshClient, plan: Plan) -> list[dict]:
     """Занятия недели на сервере по классам плана: уроки и занятия ВД."""
     if not plan.class_unit_ids:
         return []
     cu_ids = sorted(plan.class_unit_ids)
     items = client.schedule_items(plan.week, cu_ids)
+    sync_ec_schedule(client, plan)
     if plan.ec_schedule_id:
         items += client.ec_schedule_items(plan.ec_schedule_id, cu_ids)
     return [it for it in items if not it.get("cancelled")]
@@ -633,11 +653,14 @@ def apply_plan(client: MeshClient, plan: Plan, journal: Journal | None = None,
         done += 1
         if progress:
             progress(done, total)
-    if plan.ec_schedule_id is None and any(p.kind == "ec" for p in plan.to_create):
-        # до удалений: если расписание ВД не создать, занятия ВД не создать тоже — лучше узнать заранее
+    if any(p.kind == "ec" for p in plan.to_create):
+        # до удалений: если расписание ВД не создать, занятия ВД не создать тоже — лучше узнать заранее.
+        # id расписания — с сервера прямо сейчас: между планом и загрузкой сайт мог его пересоздать
         try:
-            plan.ec_schedule_id = _created_id(client.create_ec_schedule(plan.week))
-            log.info("создано расписание ВД недели %s: id %s", plan.week, plan.ec_schedule_id)
+            sync_ec_schedule(client, plan)
+            if plan.ec_schedule_id is None:
+                plan.ec_schedule_id = _created_id(client.create_ec_schedule(plan.week))
+                log.info("создано расписание ВД недели %s: id %s", plan.week, plan.ec_schedule_id)
         except MeshError as e:
             ec_error = e.message
             res.errors.append((f"создание расписания ВД недели {plan.week}", e.message))

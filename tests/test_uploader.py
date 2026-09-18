@@ -15,11 +15,17 @@ class FakeClient:
     """Считает вызовы; ответы на создание задаются списком (dict — обычный ответ, str — тело не JSON,
     MeshError — ошибка сервера)."""
 
-    def __init__(self, create_responses=(), ec_schedule=None, existing=()):
+    def __init__(self, create_responses=(), ec_schedule=None, existing=(), ec_schedules=None):
         self.calls: list[tuple] = []
         self.create_responses = list(create_responses)
         self.ec_schedule = ec_schedule
         self.existing = list(existing)
+        # что сервер отдаёт списком расписаний ВД (по умолчанию — как в _rd(): неделя 16 → 950)
+        self.ec_schedules_list = [{"id": 950, "week_number": 16, "academic_year_id": 14}] if ec_schedules is None else ec_schedules
+        self.ay = 14
+
+    def ec_schedules(self):
+        return self.ec_schedules_list
 
     def _next(self, what, *args):
         self.calls.append((what,) + args)
@@ -78,7 +84,7 @@ def test_apply_creates_ec_schedule_before_deleting(tmp_path):
     stale = {"id": 77, "group_id": 10, "date": [2025, 12, 16], "bell_id": 7001, "teacher_id": 100, "room_id": 500, "class_unit_id": 1}
     uploader.diff_plan(plan, [stale], replace=True, rd=rd)
     assert [d["id"] for d in plan.to_delete] == [77] and len(plan.to_create) == 2
-    client = FakeClient(ec_schedule={"id": 951})
+    client = FakeClient(ec_schedule={"id": 951}, ec_schedules=[])
     journal = Journal(tmp_path / "j.jsonl")
     res = uploader.apply_plan(client, plan, journal)
     assert (res.created, res.deleted, res.errors) == (2, 1, [])
@@ -97,11 +103,11 @@ def test_apply_ec_schedule_failure_does_not_delete_blindly(tmp_path):
     plan = _plan(rd)
     uploader.diff_plan(plan, [{"id": 77, "group_id": 10, "date": [2025, 12, 16], "bell_id": 7001, "teacher_id": 100,
                                "room_id": 500, "class_unit_id": 1}], replace=True, rd=rd)
-    client = FakeClient(ec_schedule=MeshError(500, "нет"))
+    client = FakeClient(ec_schedule=MeshError(500, "нет"), ec_schedules=[])
     res = uploader.apply_plan(client, plan, Journal(tmp_path / "j.jsonl"), stop_on_error=True)
     assert res.deleted == 0 and res.created == 0 and [c[0] for c in client.calls] == ["create_ec_schedule"]
     assert "расписания ВД" in res.errors[0][0]
-    client = FakeClient(ec_schedule=MeshError(500, "нет"))
+    client = FakeClient(ec_schedule=MeshError(500, "нет"), ec_schedules=[])
     res = uploader.apply_plan(client, plan, Journal(tmp_path / "j.jsonl"))
     assert res.deleted == 1 and res.created == 1 and len(res.errors) == 2
     assert "не создано" in res.errors[1][1] and [c[0] for c in client.calls] == ["create_ec_schedule", "delete_item", "create_item"]
@@ -268,3 +274,27 @@ def test_undo_parallel(tmp_path):
     res = uploader.undo(client, journal, workers=4)
     assert (res.deleted, res.errors, res.stopped) == (6, [], False) and journal.read() == []
     assert sorted(c[2] for c in client.calls) == list(range(100, 106))
+
+
+def test_ec_schedule_id_taken_from_server_not_cache(tmp_path):
+    """Сайт пересоздаёт расписания недель ВД: в кэше id 950, на сервере уже 977. Занятие ВД должно
+    уйти в 977 (иначе оно «повисает» в старом расписании), а выборка занятий — по 977."""
+    rd = _rd()
+    plan = _plan(rd)
+    assert plan.ec_schedule_id == 950
+    client = FakeClient(ec_schedules=[{"id": 977, "week_number": 16, "academic_year_id": 14},
+                                      {"id": 960, "week_number": 17, "academic_year_id": 14}])
+    uploader.fetch_existing(client, plan)
+    assert plan.ec_schedule_id == 977
+    plan.ec_schedule_id = 950                       # как если бы план строился без сервера
+    uploader.diff_plan(plan, [], replace=False, rd=rd)
+    res = uploader.apply_plan(client, plan, uploader.Journal(tmp_path / "j.jsonl"))
+    assert res.errors == [] and plan.ec_schedule_id == 977
+    assert [c for c in client.calls if c[0] == "create_ec_item"] == [("create_ec_item", 977, 600)]
+    assert [c[0] for c in client.calls if c[0] == "create_ec_schedule"] == []
+    # расписания на сервере нет вовсе — создаём, как раньше
+    client = FakeClient(ec_schedule={"id": 978}, ec_schedules=[])
+    plan.ec_schedule_id = 950
+    uploader.diff_plan(plan, [], replace=False, rd=rd)
+    res = uploader.apply_plan(client, plan)
+    assert res.errors == [] and plan.ec_schedule_id == 978 and ("create_ec_schedule", 16) in client.calls

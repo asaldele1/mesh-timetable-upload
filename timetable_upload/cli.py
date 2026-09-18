@@ -165,13 +165,14 @@ def cmd_weeks(args):
                 if l.get("hours"):
                     loads[l["week_number"]] = loads.get(l["week_number"], 0) + 1
     print(f"Учебный год {rd.academic_year.get('name')}: {rd.academic_year.get('begin_date')} — {rd.academic_year.get('end_date')}")
+    ec_by_week = {x["week_number"]: x for x in client.ec_schedules()} if client else {}   # id недель ВД в кэше могли устареть
     for s in sorted(rd.schedules, key=lambda x: x["week_number"]):
         wk = s["week_number"]
         monday = (w1 + _dt.timedelta(days=7 * (wk - 1))).isoformat() if w1 else ""
         if client:
             items = client.schedule_items(wk, cu_ids)
             classes = len({it.get("class_unit_id") for it in items})
-            ec_sched = rd.ec_schedule_by_week.get(wk)
+            ec_sched = ec_by_week.get(wk)
             ec_items = client.ec_schedule_items(ec_sched["id"], cu_ids) if ec_sched else []
             count = f"уроков на сервере {len(items):5} (классов {classes:2}), занятий ВД {len(ec_items):4}"
         else:

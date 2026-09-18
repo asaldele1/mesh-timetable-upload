@@ -328,8 +328,10 @@ class MeshClient:
 
     def ec_schedules(self) -> list:
         """Расписания ВД по неделям текущего года (id, week_number); недостающие недели создаёт
-        :meth:`create_ec_schedule` (веб-интерфейс делает это сам при открытии раздела)."""
-        return self.get(f"{EC}/ec_schedules") or []
+        :meth:`create_ec_schedule` (веб-интерфейс делает это сам при открытии раздела).
+        id расписания недели не постоянен — сайт их пересоздаёт, поэтому перед записью
+        занятий ВД список запрашивается заново (``uploader.sync_ec_schedule``)."""
+        return self.get(f"{EC}/ec_schedules", per_page=300) or []
 
     def create_ec_schedule(self, week_number: int) -> dict:
         return self.post(f"{EC}/ec_schedules", {"academic_year_id": self.ay, "week_number": week_number})
