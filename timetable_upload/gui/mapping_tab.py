@@ -35,10 +35,9 @@ from .common import (
     PickDialog,
     RowModel,
     TableView,
-    cell,
     error,
-    filter_rows,
     info,
+    item,
     make_table,
     scrollable,
 )
@@ -171,9 +170,10 @@ class EntityTab(QWidget):
         self.stale = False
         vbar = self.table.verticalScrollBar().value()
         with self.model.bulk():
-            self.model.set_rows([])
             if ctx is not None:
                 self.fill_rows(ctx)
+            else:
+                self.model.set_rows([])
         self.table.fit_columns()
         self.table.verticalScrollBar().setValue(vbar)
         self.apply_filter()
@@ -187,7 +187,7 @@ class EntityTab(QWidget):
         raise NotImplementedError
 
     def apply_filter(self) -> None:
-        shown = filter_rows(self.table, self.search.text(), self.only_problems.isChecked(), self.problem_col)
+        shown = self.table.filter(self.search.text(), self.only_problems.isChecked(), self.problem_col)
         self.count_label.setText(f"{shown} из {self.model.rowCount()}")
 
     def _edited(self, row: int, col: int) -> None:
@@ -208,8 +208,7 @@ class EntityTab(QWidget):
         pass
 
     def set_status(self, row: int, col: int, text: str, color) -> None:
-        self.model.put(row, col, text, tip=text)
-        self.model.set_color(row, color)
+        self.model.put(row, col, text, tip=text, color=color)
 
     def key_at(self, row: int):
         """Ключ строки: имя сущности, для групп — занятие."""
@@ -399,10 +398,13 @@ class RoomsTab(EntityTab):
     COL_NAME, COL_N, COL_MESH, COL_STATUS = range(4)
     editable_cols = (COL_MESH,)
 
+    def __init__(self, owner):
+        self._filling = False              # идёт заполнение таблицы префиксов — itemChanged не обрабатывать
+        super().__init__(owner)
+
     def setup_table(self):
         self.table.setItemDelegateForColumn(self.COL_MESH, ChoiceDelegate(lambda row: self.ctx.room_choices, self.table))
         # таблица префиксов → здание
-        self._filling = False
         self.prefixes = make_table(["Префикс кабинета", "Здание МЭШ (для автоподбора номеров)"])
         self.prefixes.setItemDelegateForColumn(1, ChoiceDelegate(lambda row: self.ctx.building_choices, self.prefixes))
         self.prefixes.setMaximumHeight(140)
@@ -421,9 +423,9 @@ class RoomsTab(EntityTab):
                 for pfx, bid in sorted(ctx.m.room_prefixes.items()):
                     r = self.prefixes.rowCount()
                     self.prefixes.insertRow(r)
-                    self.prefixes.setItem(r, 0, cell(repr(pfx), pfx))
+                    self.prefixes.setItem(r, 0, item(repr(pfx), pfx))
                     lab = ctx.building_label(bid) if bid else ""
-                    self.prefixes.setItem(r, 1, cell(lab, bid, editable=True, color=None if bid else COLOR_WARN))
+                    self.prefixes.setItem(r, 1, item(lab, bid, editable=True, color=None if bid else COLOR_WARN))
                 self.prefixes.fit_columns()
             # префиксов обычно 1–3: не отбирать у основной таблицы больше места, чем нужно
             self.prefixes.setMaximumHeight(min(140, 40 + 31 * max(1, self.prefixes.rowCount())))
@@ -678,8 +680,8 @@ class SettingsTab(QWidget):
             for k, v in sorted(m.subject_synonyms.items()):
                 r = self.syn.rowCount()
                 self.syn.insertRow(r)
-                self.syn.setItem(r, 0, cell(k, editable=True))
-                self.syn.setItem(r, 1, cell("; ".join(v), editable=True))
+                self.syn.setItem(r, 0, item(k, editable=True))
+                self.syn.setItem(r, 1, item("; ".join(v), editable=True))
             self.syn.fit_columns(600)
             self.durations.setText(", ".join(str(x) for x in m.ec_durations))
             self.ec_suffix.setText(m.ec_course_suffix)
@@ -743,8 +745,8 @@ class SettingsTab(QWidget):
         r = self.syn.rowCount()
         self._filling = True
         self.syn.insertRow(r)
-        self.syn.setItem(r, 0, cell("", editable=True))
-        self.syn.setItem(r, 1, cell("", editable=True))
+        self.syn.setItem(r, 0, item("", editable=True))
+        self.syn.setItem(r, 1, item("", editable=True))
         self._filling = False
         self.syn.editItem(self.syn.item(r, 0))
 

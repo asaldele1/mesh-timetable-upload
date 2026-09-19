@@ -219,6 +219,11 @@ _brushes: dict[str, QBrush] = {}
 _DISPLAY, _EDIT, _TOOLTIP, _USER = Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole, Qt.ItemDataRole.ToolTipRole, Qt.ItemDataRole.UserRole
 _BACKGROUND, _FOREGROUND, _CHECK = Qt.ItemDataRole.BackgroundRole, Qt.ItemDataRole.ForegroundRole, Qt.ItemDataRole.CheckStateRole
 _CHECKED, _UNCHECKED = Qt.CheckState.Checked, Qt.CheckState.Unchecked
+KEEP_COLOR = object()               # put(): цвет строки не менять
+
+
+def _same_color(a: QColor | None, b: QColor | None) -> bool:
+    return a is b or (a is not None and b is not None and a == b)
 _FLAGS_RO = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
 _FLAGS_EDIT = _FLAGS_RO | Qt.ItemFlag.ItemIsEditable
 _EDITABLE, _CHECKABLE = Qt.ItemFlag.ItemIsEditable, Qt.ItemFlag.ItemIsUserCheckable
@@ -240,7 +245,7 @@ class RowModel(QAbstractTableModel):
     Столбцы ``editable_cols`` редактируются (обычно через ChoiceDelegate), ``check_cols`` показывают
     флажок (значение ячейки — bool).  ``keys`` — ключ строки (имя сущности, занятие).  Правки
     пользователя (редактор, флажок) приходят сигналом ``edited``; программные изменения
-    (:meth:`put`, :meth:`set_color`, :meth:`set_rows`) его не вызывают.  Массовое заполнение —
+    (:meth:`put`, :meth:`set_rows`) его не вызывают.  Массовое заполнение —
     внутри ``with model.bulk():`` — одна перезагрузка представления вместо тысяч уведомлений.
     """
     edited = Signal(int, int)
@@ -338,15 +343,14 @@ class RowModel(QAbstractTableModel):
         """Контекст массового изменения: представление перезагружается один раз по выходу."""
         return _Bulk(self)
 
-    def set_rows(self, rows: list[list[Cell]], keys: list | None = None, colors: list | None = None) -> None:
+    def set_rows(self, rows: list[list[Cell]], keys: list | None = None) -> None:
         if not self._bulk:
-            with self.bulk():
-                self.set_rows(rows, keys, colors)
-            return
-        n = len(rows)
+            self.beginResetModel()
         self.rows = rows
-        self.keys = list(keys) if keys is not None else [None] * n
-        self.colors = list(colors) if colors is not None else [None] * n
+        self.keys = list(keys) if keys is not None else [None] * len(rows)
+        self.colors = [None] * len(rows)
+        if not self._bulk:
+            self.endResetModel()
 
     def cell(self, row: int, col: int) -> Cell:
         return self.rows[row][col]
@@ -360,25 +364,20 @@ class RowModel(QAbstractTableModel):
     def key(self, row: int):
         return self.keys[row]
 
-    def put(self, row: int, col: int, text, value=None, tip: str = "") -> bool:
-        """Записать текст, значение и подсказку ячейки; True, если что-то изменилось."""
+    def put(self, row: int, col: int, text, value=None, tip: str = "", color=KEEP_COLOR) -> bool:
+        """Записать текст, значение и подсказку ячейки (и, если задан ``color``, цвет строки: None —
+        обычный).  True, если что-то изменилось; представление уведомляется один раз."""
         cell = self.rows[row][col]
         text = "" if text is None else str(text)
-        if cell.text == text and cell.value == value and cell.tip == tip:
-            return False
+        changed = not (cell.text == text and cell.value == value and cell.tip == tip)
         cell.text, cell.value, cell.tip = text, value, tip
-        self._changed(row, col, col)
-        return True
-
-    def set_check(self, row: int, col: int, on: bool) -> None:
-        self.rows[row][col].value = bool(on)
-        self._changed(row, col, col)
-
-    def set_color(self, row: int, color: QColor | None) -> None:
-        if self.colors[row] is color or (color is not None and self.colors[row] is not None and color == self.colors[row]):
-            return
-        self.colors[row] = color
-        self._changed(row, 0, len(self.headers) - 1)
+        if color is not KEEP_COLOR and not _same_color(self.colors[row], color):
+            self.colors[row] = color
+            self._changed(row, 0, len(self.headers) - 1)
+            return True
+        if changed:
+            self._changed(row, col, col)
+        return changed
 
     def notify_rows(self, first: int, last: int) -> None:
         """Сообщить представлению об изменении строк ``first..last`` (после серии тихих правок)."""
@@ -412,6 +411,9 @@ class TableView(_FitColumns, QTableView):
         super().__init__()
         self.setModel(model)
         self._init_fit()
+        # полоса прокрутки всегда: иначе её появление после измерения строк сужает область просмотра,
+        # растягиваемый столбец меняет ширину, и высоты строк приходится мерить заново
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self._sized: set[int] = set()          # строки, высота которых уже подогнана
         self._one_line = 0                     # высота однострочной ячейки (для строк, ещё не измеренных)
         self._rows_timer = QTimer(self)
@@ -437,10 +439,10 @@ class TableView(_FitColumns, QTableView):
         self._sized.difference_update(range(tl.row(), br.row() + 1))
         self._rows_timer.start()
 
-    def _columns_changed(self, *_) -> None:
+    def _columns_changed(self, _logical, old: int, new: int) -> None:
         # при перетаскивании границы столбца сигналы идут непрерывно — пересчёт с задержкой
         # (столбцы, выставленные самой подгонкой, учтёт _fit_rows)
-        if not self._fit_pending:
+        if old != new and not self._fit_pending:
             self._sized.clear()
             self._rows_timer.start(150)
 
@@ -448,8 +450,21 @@ class TableView(_FitColumns, QTableView):
         super().resizeEvent(event)
         self._rows_timer.start()
 
-    def rows_hidden_changed(self) -> None:
+    def filter(self, text: str, only_problems: bool = False, problem_col: int | None = None) -> int:
+        """Скрыть строки, не содержащие текст (в любой ячейке) либо не помеченные как проблемные.
+        Проблемной считается строка с непустым текстом в столбце problem_col.  Возвращает число видимых строк."""
+        needle = text.strip().lower()
+        shown = 0
+        for r, row in enumerate(self.model().rows):
+            hide = False
+            if needle:
+                hide = not any(needle in c.text.lower() for c in row)
+            if not hide and only_problems and problem_col is not None:
+                hide = not row[problem_col].text.strip()
+            self.setRowHidden(r, hide)
+            shown += not hide
         self._rows_timer.start()
+        return shown
 
     def _size_visible_rows(self) -> None:
         self._rows_timer.stop()
@@ -480,25 +495,7 @@ class TableView(_FitColumns, QTableView):
                 vh.setDefaultSectionSize(self._one_line)
 
 
-def filter_rows(view: TableView, text: str, only_problems: bool = False, problem_col: int | None = None) -> int:
-    """Скрывает строки, не содержащие текст (в любой ячейке) либо не помеченные как проблемные.
-    Проблемной считается строка с непустым текстом в столбце problem_col.  Возвращает число видимых строк."""
-    needle = text.strip().lower()
-    shown = 0
-    model: RowModel = view.model()
-    for r, row in enumerate(model.rows):
-        hide = False
-        if needle:
-            hide = not any(needle in c.text.lower() for c in row)
-        if not hide and only_problems and problem_col is not None:
-            hide = not row[problem_col].text.strip()
-        view.setRowHidden(r, hide)
-        shown += not hide
-    view.rows_hidden_changed()
-    return shown
-
-
-def cell(text, value=None, editable: bool = False, color: QColor | None = None, tip: str = "") -> QTableWidgetItem:
+def item(text, value=None, editable: bool = False, color: QColor | None = None, tip: str = "") -> QTableWidgetItem:
     it = QTableWidgetItem("" if text is None else str(text))
     if value is not None:
         it.setData(Qt.UserRole, value)
@@ -511,7 +508,7 @@ def cell(text, value=None, editable: bool = False, color: QColor | None = None, 
     return it
 
 
-def check_cell(checked: bool, tip: str = "") -> QTableWidgetItem:
+def check_item(checked: bool, tip: str = "") -> QTableWidgetItem:
     it = QTableWidgetItem()
     it.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
     it.setCheckState(Qt.Checked if checked else Qt.Unchecked)

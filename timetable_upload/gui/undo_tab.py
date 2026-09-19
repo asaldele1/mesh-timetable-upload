@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 
 from .. import uploader
 from ..uploader import Journal, journal_key
-from .common import Cell, RowModel, TableView, ask, error, filter_rows
+from .common import Cell, RowModel, TableView, ask, error
 
 
 class UndoTab(QWidget):
@@ -88,7 +88,7 @@ class UndoTab(QWidget):
         self.apply_filter()
 
     def apply_filter(self):
-        filter_rows(self.table, self.search.text())
+        self.table.filter(self.search.text())
         self._update_count()
 
     def _changed(self, row, col):

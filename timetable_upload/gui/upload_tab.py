@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 from .. import export, uploader
 from ..mesh_api import MAX_WORKERS
 from ..uploader import DAYS, Journal, Selection
-from .common import CheckListDialog, WrapDelegate, ask, cell, check_cell, error, make_table, scrollable
+from .common import CheckListDialog, WrapDelegate, ask, check_item, error, item, make_table, scrollable
 
 _D = "%d.%m.%Y"
 
@@ -219,10 +219,10 @@ class UploadTab(QWidget):
                 wk = s["week_number"]
                 r = self.weeks.rowCount()
                 self.weeks.insertRow(r)
-                self.weeks.setItem(r, 0, check_cell(wk in checked))
-                self.weeks.setItem(r, 1, cell(wk, wk))
-                self.weeks.setItem(r, 2, cell(week_span(w1 + _dt.timedelta(days=7 * (wk - 1))) if w1 else "?"))
-                self.weeks.setItem(r, 3, cell(""))
+                self.weeks.setItem(r, 0, check_item(wk in checked))
+                self.weeks.setItem(r, 1, item(wk, wk))
+                self.weeks.setItem(r, 2, item(week_span(w1 + _dt.timedelta(days=7 * (wk - 1))) if w1 else "?"))
+                self.weeks.setItem(r, 3, item(""))
             self.weeks.fit_columns()
         self.weeks.blockSignals(False)
 
