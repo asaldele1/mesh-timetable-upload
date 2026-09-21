@@ -672,15 +672,15 @@ class CheckListDialog(QDialog):
             return
         self._busy = True
         try:
-            if it.checkState() == Qt.Checked:
-                # вновь отмеченный — в конец отмеченных
-                row = self.list.row(it)
-                target = max((i for i in self._checked_rows() if i != row), default=-1) + 1
-                if target > row:
-                    target -= 1
-                if target != row:
-                    self.list.insertItem(target, self.list.takeItem(row))
-                    self.list.setCurrentItem(it)
+            # вновь отмеченный — в конец отмеченных; снятый — сразу за ними, чтобы не разрывать
+            # блок отмеченных (иначе «Выше/Ниже» через него не пройдут)
+            row = self.list.row(it)
+            target = max((i for i in self._checked_rows() if i != row), default=-1) + 1
+            if target > row:
+                target -= 1
+            if target != row:
+                self.list.insertItem(target, self.list.takeItem(row))
+                self.list.setCurrentItem(it)
             self._renumber()
         finally:
             self._busy = False

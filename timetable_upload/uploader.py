@@ -358,7 +358,8 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
                 continue
             key = ("ec", g["id"], date.isoformat(), begin) if is_ec(g) else ("oo", g["id"], date.isoformat(), bell["id"])
             cap = rd.group_hours(g, week, tid)
-            if key in on_server or cap is None or used[g["id"]] < cap:
+            # слот уже занят потоком (другой класс той же метагруппы) — то же занятие, часы не тратятся
+            if key in on_server or key in seen or cap is None or used[g["id"]] < cap:
                 chosen = (link, tid, why, key)
                 break
             fallback = fallback or (link, tid, why, key)
@@ -429,7 +430,9 @@ def plan_week(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int, week1_mon
         return plan
     existing = fetch_existing(client, plan)
     if existing:
+        ec_id = plan.ec_schedule_id          # уточнён на сервере в fetch_existing
         plan = build_plan(tt, rd, m, week, week1_monday, sel, existing, replace)
+        plan.ec_schedule_id = ec_id
     diff_plan(plan, existing, replace, rd)
     return plan
 

@@ -522,3 +522,19 @@ def test_match_groups_reports_hours():
     rep = mapping.MatchReport()
     mapping._match_groups(_timetable(lessons), lessons, rd, m, rep)
     assert any("приоритет 2 «Труд»" in x and "не найдена в кэше" in x for x in rep.lines)
+
+
+def test_build_plan_flow_keeps_one_group_when_hours_exhausted():
+    """Поток двух классов на метагруппу с 1 ч/нед: второй класс видит слот уже занятым потоком и не уходит
+    во 2-й приоритет — одно занятие, а не два в разных группах."""
+    rd = _rd_prio()
+    for g in rd.groups:
+        if g["id"] in (20, 21):
+            g["is_metagroup"], g["class_unit_ids"] = True, [1, 2]
+    rd._index()
+    m = _m_prio(names=("Информатика", "Технология"))
+    m.classes["11Б"] = "11-Б"
+    lessons = [_lesson("11в", "Информатика", 0, "Лебедева А.С.", potok=("11Б", "11в"), day=0, lesson=0),
+               _lesson("11Б", "Информатика", 0, "Лебедева А.С.", potok=("11Б", "11в"), day=0, lesson=0)]
+    plan = uploader.build_plan(_timetable(lessons), rd, m, 16, datetime.date(2025, 9, 1))
+    assert [(p.group_id, p.priority, p.over_hours) for p in plan.items] == [(20, 1, False)] and plan.skipped == []

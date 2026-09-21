@@ -347,7 +347,7 @@ def _match_rooms(lessons, rd, m, rep):
         m.room_prefixes.setdefault(pfx, None)
         sc = scores(pfx)
         if sc:
-            rep.problem(f"  префикс {pfx!r}: здание не определено однозначно, совпадения по зданиям: {', '.join(f"{b}: {n}" for b, n in sc.items())}")
+            rep.problem(f"  префикс {pfx!r}: здание не определено однозначно, совпадения по зданиям: {', '.join(f'{b}: {n}' for b, n in sc.items())}")
         else:
             rep.problem(f"  префикс {pfx!r}: ни один номер не совпал с кабинетами МЭШ")
     for name, cnt in sorted(used.items(), key=lambda x: -x[1]):

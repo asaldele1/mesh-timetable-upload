@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import os
+import threading
 import time
 
 import requests
@@ -24,6 +25,10 @@ import requests
 from . import paths
 
 log = logging.getLogger(__name__)
+
+# обновление токена из нескольких потоков (GUI: фоновые справочники + задача) — по очереди, чтобы
+# refresh-токен не был использован дважды
+_refresh_lock = threading.Lock()
 
 TOKEN_ENV = "MESH_TOKEN"
 REFRESH_PATH = "/v3/token/refresh"
@@ -116,6 +121,11 @@ def current_token(token_file: str | None = None, force: bool = False, margin: in
     """Годный токен: из файла (или переменной MESH_TOKEN); если он истекает и есть refresh-токен —
     обновляется и переписывается вместе с новым refresh-токеном.  force — обновить в любом случае
     (например, после ответа 401)."""
+    with _refresh_lock:
+        return _current_token(token_file, force, margin, http)
+
+
+def _current_token(token_file: str | None, force: bool, margin: int, http: requests.Session | None) -> str:
     token_file = token_file or paths.token_file()
     token = _read(token_file) or os.environ.get(TOKEN_ENV, "").strip()
     refresh_token = _read(refresh_file_for(token_file))

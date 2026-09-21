@@ -46,6 +46,7 @@ class UploadTab(QWidget):
         self.state = app.state
         self.plans: list[uploader.Plan] = []
         self.plans_online = False
+        self._gated_summary = ""
         self.shown: tuple[str, object] | None = None    # что сейчас в дереве: ("plan", планы) | ("result", итоги загрузки)
 
         split = QSplitter(Qt.Horizontal)
@@ -200,9 +201,16 @@ class UploadTab(QWidget):
         for b in (self.plan_btn, self.compare_btn, self.count_btn):
             b.setEnabled(not busy)
         if busy:
+            self._gated_summary = self.summary.text()      # вернуть, если обновление сорвалось и план остался
             self.apply_btn.setEnabled(False)
-        self.summary.setText("Справочники обновляются с сервера — план можно построить после загрузки." if busy
-                             else (self.summary.text() if self.plans else "План не построен."))
+            self.summary.setText("Справочники обновляются с сервера — план можно построить после загрузки.")
+        elif self.plans:
+            self.summary.setText(self._gated_summary or self.summary.text())
+            self.apply_btn.setEnabled(self.plans_online and any(p.to_create or p.to_delete for p in self.plans))
+        else:
+            self.summary.setText("План не построен.")
+        if not busy:
+            self._gated_summary = ""
 
     def fill_weeks(self):
         st = self.state
