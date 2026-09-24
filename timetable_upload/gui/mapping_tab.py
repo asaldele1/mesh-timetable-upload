@@ -23,7 +23,16 @@ from PySide6.QtWidgets import (
 )
 
 from .. import chngf
-from ..mapping import GroupResolver, Mapping, group_key, is_ec, match_all, relevant_lessons, split_group_key
+from ..mapping import (
+    GroupResolver,
+    Mapping,
+    group_key,
+    group_teacher_ids,
+    is_ec,
+    match_all,
+    relevant_lessons,
+    split_group_key,
+)
 from ..refdata import ec_course_name, norm_text
 from .common import (
     COLOR_BAD,
@@ -471,8 +480,8 @@ class RoomsTab(EntityTab):
 class GroupsTab(EntityTab):
     """Строка на каждую классогруппу и каждый приоритет её предмета (название МЭШ, по которому в классе
     есть группы): уроки недели заполняют группу 1-го приоритета до её часов, затем 2-го и т. д."""
-    headers = ["Класс", "Предмет", "Гр.", "Прио.", "Учитель", "Ур./нед", "Часов/нед", "Состояние", "Группа МЭШ",
-               "Задано вручную (двойной щелчок)", "Как выбрана"]
+    headers = ["Класс", "Предмет", "Гр.", "Прио.", "Учитель (двойной щелчок)", "Ур./нед", "Часов/нед", "Состояние",
+               "Группа МЭШ", "Задано вручную (двойной щелчок)", "Как выбрана"]
     problem_col = 7
     COL_CLS, COL_SUBJ, COL_GRP, COL_PRIO, COL_TEACHER, COL_N, COL_HOURS, COL_STATUS, COL_MESH, COL_MANUAL, COL_WHY = range(11)
     stats: Counter = Counter()                 # ok / weak / over / bad / ec по строкам (после заполнения)
@@ -523,17 +532,18 @@ class GroupsTab(EntityTab):
             g, why = link.group, link.why
             explicit = m.groups.get(group_key(l, prio))
             eg = ctx.rd.any_group(explicit) if explicit else None
-            tid = resolver.teacher_id(l)
+            tid, note = resolver.teacher_for(l, link) if g else (None, "")
+            if note:
+                why += f"; {note}"
             hours = ctx.rd.group_hours_span(g, tid) if g else ""
             n_les = self.value_at(r, self.COL_N)
-            group_teachers = [t.get("id") for t in (g or {}).get("teachers") or []]
             if g is None:
                 kind, status, color = "bad", _short_reason(why), COLOR_BAD
-            elif "проверьте" in why:
-                kind, status, color = "weak", "проверьте", COLOR_WARN
-            elif group_teachers and (tid if tid is not None else (group_teachers[0] if len(group_teachers) == 1 else None)) not in group_teachers:
+            elif tid is None:
                 # план такую группу пропустит: сервер принимает только учителя, привязанного к группе
                 kind, status, color = "weak", "учитель не привязан к группе МЭШ", COLOR_WARN
+            elif "проверьте" in why:
+                kind, status, color = "weak", "проверьте", COLOR_WARN
             else:
                 kind, status, color = "ok", "", None
                 if prio == 1 and hours and n_les > min(_hours_range(hours)):
@@ -543,7 +553,9 @@ class GroupsTab(EntityTab):
                     else:
                         kind, status, color = "over", "уроков больше часов группы — лишние встанут сверх часов", COLOR_WARN
             self._kinds[r] = (kind, is_ec(g))
-            touched = model.put(r, self.COL_HOURS, hours, tip="часов в неделю по нагрузке учителя в МЭШ" if hours else "нет данных о нагрузке")
+            t_text, t_tip = self._teacher_cell(l, prio)
+            touched = model.put(r, self.COL_TEACHER, t_text, tip=t_tip)
+            touched |= model.put(r, self.COL_HOURS, hours, tip="часов в неделю по нагрузке учителя в МЭШ" if hours else "нет данных о нагрузке")
             touched |= model.put(r, self.COL_MESH, ctx.group_short(g) if g else "", tip=ctx.group_label(g) if g else "")
             touched |= model.put(r, self.COL_WHY, why, tip=why)
             touched |= model.put(r, self.COL_MANUAL, ctx.group_short(eg) if eg else (f"id {explicit}" if explicit else ""),
@@ -555,7 +567,20 @@ class GroupsTab(EntityTab):
         self.stats["ec"] = sum(ec for _, ec in self._kinds)
         return changed
 
+    def _teacher_cell(self, l: chngf.Lesson, prio: int) -> tuple[str, str]:
+        """(текст, подсказка) столбца «Учитель»: учитель ХроноГрафа и, если задана принудительная
+        привязка, учитель МЭШ, от имени которого ставятся занятия."""
+        forced = self._resolver.forced_teacher(l, prio)
+        if not forced:
+            return l.teacher or "", ""
+        name = (self.ctx.rd.teacher_by_id.get(forced) or {}).get("name") or f"id {forced}"
+        return (f"{l.teacher or '—'} → {name}",
+                f"привязано принудительно: занятия поставятся от учителя МЭШ {name} (id {forced})")
+
     def on_double_clicked(self, row, col):
+        if col == self.COL_TEACHER:
+            self.force_teacher(row)
+            return
         ctx, l, prio = self.ctx, self.key_at(row), self.prio_at(row)
         cu_id = ctx.class_unit_id(l.cls)
         if cu_id is None:
@@ -598,18 +623,73 @@ class GroupsTab(EntityTab):
             ctx.m.groups.pop(key, None)
         else:
             ctx.m.groups[key] = value
+        forced = ctx.m.force_teachers.get(key)
+        if forced and forced not in group_teacher_ids(ctx.rd.any_group(value) if value else None):
+            ctx.m.force_teachers.pop(key, None)    # привязка к учителю прежней группы устарела
         n_before = len(self._resolver.resolve_chain(l))
         # от выбора зависят ещё строки идентичных подгрупп (GroupResolver подбирает им группу по составу
         # учеников уже сопоставленных) — пересчитываем их, остальные строки не трогаем
         identical = self._resolver.identical.get(l.clsgrp_index, ())
         rows_ = list(self._rows_by_clsgrp.get(l.clsgrp_index, ())) + \
                 [r for i in sorted(identical) for r in self._rows_by_clsgrp.get(i, ())]
+        rebuilt = self._apply_edit(rows_, l, n_before)
+        # выбранная группа не примет занятия от учителя ХроноГрафа — сразу предлагаем принудительную привязку
+        if not rebuilt and self.text_at(row, self.COL_STATUS) == "учитель не привязан к группе МЭШ":
+            self.force_teacher(row)
+
+    def force_teacher(self, row: int) -> None:
+        """Принудительная привязка классогруппы к учителю группы МЭШ: занятия ставятся от его имени,
+        даже если учитель ХроноГрафа — другой (сервер принимает только учителя группы)."""
+        ctx, l, prio = self.ctx, self.key_at(row), self.prio_at(row)
+        key = group_key(l, prio)
+        link = next((lk for lk in self._resolver.resolve_chain(l) if lk.prio == prio), None)
+        g = link.group if link else None
+        if g is None:
+            info(self, "Учитель группы МЭШ",
+                 "Для этой строки не выбрана группа МЭШ — сначала задайте её (двойной щелчок в столбце "
+                 "«Задано вручную»).")
+            return
+        ids = group_teacher_ids(g)
+        if not ids:
+            info(self, "Учитель группы МЭШ", f"В группе «{g['name']}» нет учителей — привязывать не к кому; "
+                                             "занятия поставятся от сопоставленного учителя.")
+            return
+        tid = self._resolver.teacher_id(l)
+        rows = [([(ctx.rd.teacher_by_id.get(i) or {}).get("name") or "?", ctx.rd.group_hours_span(g, i),
+                  "да" if i == tid else "", i], i, True) for i in ids]
+        hint = (f"Занятие: {l.cls}, {l.subject}" + (f"/{l.group}" if l.group else "")
+                + f", учитель ХроноГрафа {l.teacher or '—'}"
+                + (f" (в МЭШ id {tid})" if tid else " (не сопоставлен)")
+                + f". Группа МЭШ: {ctx.group_label(g)}. "
+                + "Выберите учителя группы, от имени которого ставить занятия: так занятия попадут в эту "
+                + "группу, даже если учитель в ней другой. Часы берутся из нагрузки выбранного учителя.")
+        dlg = PickDialog(f"Учитель для {l.cls} — {l.subject}" + (f"/{l.group}" if l.group else "")
+                         + (f", приоритет {prio}" if prio > 1 else ""),
+                         ["Учитель группы МЭШ", "Часов/нед", "Учитель занятия", "id"],
+                         rows, ctx.m.force_teachers.get(key), self, hint,
+                         auto_label="Без принудительной привязки")
+        if not dlg.exec():
+            return
+        value = None if dlg.is_auto() else dlg.value()
+        if value == ctx.m.force_teachers.get(key):
+            return
+        if value is None:
+            ctx.m.force_teachers.pop(key, None)
+        else:
+            ctx.m.force_teachers[key] = value
+        self._apply_edit(self._rows_by_clsgrp.get(l.clsgrp_index, [row]), l,
+                         len(self._resolver.resolve_chain(l)))
+
+    def _apply_edit(self, rows_: Iterable[int], l: chngf.Lesson, n_before: int) -> bool:
+        """Пересчитать строки после правки сопоставления; True — таблицу пришлось перестроить целиком."""
         changed = self.refresh_rows(rows_)
-        if len(self._resolver.resolve_chain(l)) != n_before:
-            self.fill(ctx)                     # число звеньев изменилось — строки перестраиваем целиком
+        rebuilt = len(self._resolver.resolve_chain(l)) != n_before
+        if rebuilt:
+            self.fill(self.ctx)                # число звеньев изменилось — строки перестраиваем целиком
         elif changed and (self.search.text().strip() or self.only_problems.isChecked()):
             self.apply_filter()                # состояние строк изменилось — фильтр «только проблемы» мог устареть
         self.owner.mapping_edited(groups_stale=False)
+        return rebuilt
 
 
 def _hours_range(span: str) -> tuple[int, int]:

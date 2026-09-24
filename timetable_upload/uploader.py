@@ -321,8 +321,10 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
             continue
         teacher_id = m.teachers.get(l.teacher) if l.teacher else None
         if teacher_id is not None and rd.teacher_deleted(teacher_id):    # сервер удалённый профиль не примет
-            skip(l, date, f"учитель удалён в МЭШ: {rd.teacher_by_id[teacher_id].get('name')} (id {teacher_id})")
-            continue
+            if not resolver.any_forced(l):
+                skip(l, date, f"учитель удалён в МЭШ: {rd.teacher_by_id[teacher_id].get('name')} (id {teacher_id})")
+                continue
+            teacher_id = None                    # занятия поставит принудительно заданный учитель
         chain = resolver.resolve_chain(l)
         if chain[0].group is None:
             skip(l, date, f"группа не найдена: {chain[0].why}")
@@ -347,15 +349,14 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
             g = link.group
             if g is None:
                 continue
-            group_teachers = [t["id"] for t in g.get("teachers") or [] if t.get("id")]
-            tid, why = teacher_id, link.why
-            if tid is None and len(group_teachers) == 1:
-                tid, why = group_teachers[0], why + "; учитель взят из группы"
-            # сервер принимает только учителя, привязанного к группе (удалённые из списка группы уже убраны)
-            if (group_teachers and tid not in group_teachers) or tid is None:
+            # сервер принимает только учителя, привязанного к группе (удалённые из списка группы уже
+            # убраны): берём сопоставленного, принудительно заданного или единственного учителя группы
+            tid, note = resolver.teacher_for(l, link)
+            if tid is None:
                 names = ", ".join(t.get("full_name") or "?" for t in g.get("teachers") or []) or "—"
                 not_attached.append(f"«{g['name']}» — {names}")
                 continue
+            why = link.why + (f"; {note}" if note else "")
             key = ("ec", g["id"], date.isoformat(), begin) if is_ec(g) else ("oo", g["id"], date.isoformat(), bell["id"])
             cap = rd.group_hours(g, week, tid)
             # слот уже занят потоком (другой класс той же метагруппы) — то же занятие, часы не тратятся
@@ -367,7 +368,8 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
         if chosen is None and fallback is None:
             if not_attached:
                 skip(l, date, ("учитель не сопоставлен" if teacher_id is None else "учитель не привязан к группе МЭШ")
-                     + ": в группе " + "; ".join(not_attached))
+                     + ": в группе " + "; ".join(not_attached)
+                     + " (можно привязать принудительно на вкладке «Группы» или через force_teachers)")
             else:
                 skip(l, date, "группа не найдена: " + "; ".join(lk.why for lk in chain if lk.group is None))
             continue

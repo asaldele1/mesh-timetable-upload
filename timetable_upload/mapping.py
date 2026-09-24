@@ -26,6 +26,7 @@ class Mapping:
     rooms: dict[str, int | None] = field(default_factory=dict)        # кабинет → id кабинета
     room_prefixes: dict[str, int | None] = field(default_factory=dict)  # префикс кабинета → id здания
     groups: dict[str, int | None] = field(default_factory=dict)       # "класс|предмет|группа" → id группы МЭШ
+    force_teachers: dict[str, int] = field(default_factory=dict)      # "класс|предмет|группа" → id учителя МЭШ (принудительно)
     ignore_subjects: list[str] = field(default_factory=list)          # предметы, которые не переносим
     ignore_classes: list[str] = field(default_factory=list)
     # настройки (значения по умолчанию — из defaults.json, копируются в файл сопоставления при сохранении)
@@ -34,7 +35,7 @@ class Mapping:
     ec_course_suffix: str = field(default_factory=lambda: load_defaults()["ec_course_suffix"])        # regex хвоста с классами в названии курса ВД
     group_ordinal_suffix: str = field(default_factory=lambda: load_defaults()["group_ordinal_suffix"])  # regex номера подгруппы в названии группы
 
-    KEYS = ("classes", "subjects", "teachers", "rooms", "room_prefixes", "groups",
+    KEYS = ("classes", "subjects", "teachers", "rooms", "room_prefixes", "groups", "force_teachers",
             "ignore_subjects", "ignore_classes")
     SETTINGS = ("subject_synonyms", "ec_durations", "ec_course_suffix", "group_ordinal_suffix")
 
@@ -78,6 +79,7 @@ class Mapping:
             "teachers: ФИО учителя из ХроноГрафа → id профиля учителя в МЭШ.",
             "rooms: кабинет ХроноГрафа → id кабинета в МЭШ.  room_prefixes: префикс кабинета → id здания (для автоподбора).",
             "groups: 'класс|предмет|номер группы' → id группы МЭШ (обычной или внеурочной деятельности) для первого приоритета, 'класс|предмет|номер группы|2' — для второго и т. д.; заполняется только там, где автоматика не справилась, но можно задать и вручную.",
+            "force_teachers: ключ как в groups → id учителя МЭШ, от имени которого ставить занятия в привязанной группе; нужен, когда учитель занятия не привязан к выбранной группе МЭШ (сервер принимает только учителя группы).",
             "ignore_subjects / ignore_classes: что не переносить.",
             "subject_synonyms: нормализованное название предмета ХроноГрафа (строчные буквы, без знаков препинания) → названия предметов/курсов МЭШ, которые подставляются при автосопоставлении.",
             "ec_durations: допустимые длительности занятия ВД в минутах; ec_course_suffix: regex хвоста с классами в названии курса ВД; group_ordinal_suffix: regex номера подгруппы («… 2гр») в названии группы МЭШ.",
@@ -413,6 +415,28 @@ def is_ec(g: dict | None) -> bool:
     return bool(g) and g.get("kind") == "ec"
 
 
+def group_teacher_ids(g: dict | None) -> list[int]:
+    return [t["id"] for t in (g or {}).get("teachers") or [] if t.get("id")]
+
+
+def pick_teacher(g: dict | None, teacher_id: int | None, forced: int | None = None) -> tuple[int | None, str]:
+    """Учитель, от имени которого занятие ставится в группу ``g``: (id, пояснение).
+
+    Сервер принимает только учителя, привязанного к группе (удалённые профили из списка группы уже
+    убраны), поэтому учитель занятия подходит не всегда.  ``forced`` — принудительная привязка из
+    ``Mapping.force_teachers``: она имеет приоритет над сопоставленным учителем.  ``None`` в ответе —
+    занятие в эту группу поставить нельзя.
+    """
+    ids = group_teacher_ids(g)
+    if forced is not None and (not ids or forced in ids):
+        return forced, "учитель задан принудительно"
+    if teacher_id is not None and (not ids or teacher_id in ids):
+        return teacher_id, ""
+    if teacher_id is None and len(ids) == 1:
+        return ids[0], "учитель взят из группы"
+    return None, ""
+
+
 def _resolve(l: chngf.Lesson, rd: RefData, m: Mapping, teacher_id: int | None,
              prio: int = 1, subj_names: list[str] | None = None) -> tuple[dict | None, str, list[dict]]:
     """(группа, пояснение, оставшиеся кандидаты): кандидаты непусты только при неоднозначности —
@@ -496,6 +520,19 @@ class GroupResolver:
     def teacher_id(self, l: chngf.Lesson) -> int | None:
         return self.m.teachers.get(l.teacher) if l.teacher else None
 
+    def forced_teacher(self, l: chngf.Lesson, prio: int = 1) -> int | None:
+        """Учитель, принудительно заданный для этой классогруппы (``Mapping.force_teachers``)."""
+        return self.m.force_teachers.get(group_key(l, prio))
+
+    def any_forced(self, l: chngf.Lesson) -> bool:
+        """Задана ли принудительная привязка учителя хотя бы для одного звена классогруппы."""
+        return any(self.forced_teacher(l, lk.prio) for lk in self.resolve_chain(l))
+
+    def teacher_for(self, l: chngf.Lesson, link: Link) -> tuple[int | None, str]:
+        """Учитель для занятия в подобранной группе звена: (id, пояснение); ``None`` — группа не
+        примет это занятие (учитель не привязан к ней)."""
+        return pick_teacher(link.group, self.teacher_id(l), self.forced_teacher(l, link.prio))
+
     def resolve(self, l: chngf.Lesson) -> tuple[dict | None, str]:
         """Группа 1-го приоритета (и пояснение) — как в отчёте и на вкладке «Группы»."""
         first = self.resolve_chain(l)[0]
@@ -575,14 +612,25 @@ def _match_groups(tt, lessons, rd, m, rep):
     for l in lessons:
         seen.setdefault(group_key(l), l)
         per_week[(group_key(l), l.week)] += 1
-    n_ok = n_weak = n_ec = n_spill = n_over = 0
+    n_ok = n_weak = n_ec = n_spill = n_over = n_noteacher = 0
     resolver = GroupResolver(tt, rd, m)
     for key, l in seen.items():
         chain = resolver.resolve_chain(l)
         g, why = chain[0].group, chain[0].why
+        tid = None
         if g:
             n_ok += 1
             n_ec += is_ec(g)
+            tid, note = resolver.teacher_for(l, chain[0])
+            if tid is None:
+                # сервер примет занятие только от учителя группы: нужна принудительная привязка
+                n_noteacher += 1
+                names = ", ".join(t.get("full_name") or "?" for t in g.get("teachers") or []) or "—"
+                rep.problem(f"  {key} → {g['name']} (id {g['id']}): учитель {l.teacher!r} не привязан к группе МЭШ "
+                            f"(в группе: {names}) — занятия будут пропущены; чтобы поставить их от учителя группы, "
+                            f'задайте force_teachers[{key!r}] = id учителя (в окне — двойной щелчок по столбцу «Учитель»)')
+            elif note:
+                rep.add(f"  {key} → {g['name']} (id {g['id']}) — {note}")
             if "проверьте" in why:
                 n_weak += 1
                 rep.add(f"  {key} → {'ВД ' if is_ec(g) else ''}{g['name']} (id {g['id']}) — {why}")
@@ -599,7 +647,7 @@ def _match_groups(tt, lessons, rd, m, rep):
             continue
         n_les = max(per_week[(key, w)] for w in range(max(1, tt.week_count)))
         # нули (каникулы, недели без нагрузки) не показательны — сравниваем с наименьшей ненулевой нагрузкой
-        hours = [h for wk in rd.schedule_by_week if (h := rd.group_hours(g, wk, resolver.teacher_id(l)))]
+        hours = [h for wk in rd.schedule_by_week if (h := rd.group_hours(g, wk, tid))]
         if not hours or n_les <= min(hours):
             continue
         rest = [lk for lk in chain[1:] if lk.group]
@@ -612,5 +660,6 @@ def _match_groups(tt, lessons, rd, m, rep):
             rep.add(f"  {key}: уроков в неделю {n_les}, часов у «{g['name']}» {min(hours)} — лишние встанут сверх часов "
                     "(при необходимости добавьте предмету второе название МЭШ)")
     rep.add(f"  сопоставлено {n_ok} из {len(seen)} (из них группы ВД: {n_ec}; по номеру группы, требуют проверки: {n_weak}"
+            + (f"; учитель не привязан к группе: {n_noteacher}" if n_noteacher else "")
             + (f"; уроков больше часов группы: с переносом в следующий приоритет {n_spill}, сверх часов {n_over}"
                if n_spill or n_over else "") + ")")

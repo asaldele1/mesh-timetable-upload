@@ -480,6 +480,53 @@ def test_build_plan_spills_by_hours():
     assert plan.items == [] and "не привязан" in plan.skipped[0][1] and "«Технология 11-В 11в»" in plan.skipped[0][1]
 
 
+def test_force_teacher_binds_group_with_other_teacher():
+    """Принудительная привязка: занятие ставится в группу, где учителя занятия нет, от имени учителя группы."""
+    rd = _rd_prio()
+    lesson = _inf(0, teacher="Зайцева Мария Игоревна")      # id 101, в группе 20 — только Лебедева (100)
+    tt = _timetable([lesson])
+    m = _m_prio(names=("Информатика",), **{"11в|Информатика|0": 20})
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1))
+    assert plan.items == [] and "не привязан" in plan.skipped[0][1]
+    m.force_teachers["11в|Информатика|0"] = 100
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1))
+    assert [(p.group_id, p.teacher_id, p.over_hours) for p in plan.items] == [(20, 100, False)]
+    assert "учитель задан принудительно" in plan.items[0].note
+    # учитель не из группы принудительной привязкой не становится её учителем
+    m.force_teachers["11в|Информатика|0"] = 999
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1))
+    assert plan.items == [] and "не привязан" in plan.skipped[0][1]
+
+
+def test_force_teacher_overrides_deleted_profile():
+    """Учитель занятия удалён в МЭШ: с принудительной привязкой занятие всё равно ставится."""
+    rd = _rd_prio()
+    rd.teacher_profiles.append({"id": 104, "name": "Уволенный У.У.", "deleted": True})
+    rd._index()
+    tt = _timetable([_inf(0)])
+    m = _m_prio(names=("Информатика",), **{"11в|Информатика|0": 20})
+    m.teachers["Лебедева А.С."] = 104
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1))
+    assert plan.items == [] and "удалён в МЭШ" in plan.skipped[0][1]
+    m.force_teachers["11в|Информатика|0"] = 100
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1))
+    assert [(p.group_id, p.teacher_id) for p in plan.items] == [(20, 100)]
+
+
+def test_match_groups_reports_unattached_teacher():
+    rd = _rd_prio()
+    lessons = [_inf(0, teacher="Зайцева Мария Игоревна")]
+    m = _m_prio(names=("Информатика",), **{"11в|Информатика|0": 20})
+    rep = mapping.MatchReport()
+    mapping._match_groups(_timetable(lessons), lessons, rd, m, rep)
+    assert any("не привязан к группе МЭШ" in x and "force_teachers" in x for x in rep.lines)
+    m.force_teachers["11в|Информатика|0"] = 100
+    rep = mapping.MatchReport()
+    mapping._match_groups(_timetable(lessons), lessons, rd, m, rep)
+    assert not any("не привязан к группе МЭШ" in x for x in rep.lines)
+    assert any("учитель задан принудительно" in x for x in rep.lines)
+
+
 def test_build_plan_counts_existing_lessons():
     rd = _rd_prio()
     lessons = [_inf(0), _inf(1), _inf(2)]
