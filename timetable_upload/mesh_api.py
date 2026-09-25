@@ -402,3 +402,17 @@ class MeshClient:
 
     def delete_ec_item(self, item_id: int) -> None:
         self.delete(f"{EC}/ec_schedule_items/{item_id}")
+
+    def ec_group_students(self, ec_group_ids: Iterable[int]) -> list:
+        """Ученики групп ВД: записи {id, student_id, ec_group_id, begin_date, end_date, ...}; id записи
+        нужен для :meth:`delete_ec_group_student`."""
+        return self.get(f"{EC}/ec_group_student", ec_group_ids=",".join(str(i) for i in ec_group_ids)) or []
+
+    def add_ec_group_student(self, ec_group_id: int, student_id: int, begin_date: str, end_date: str) -> dict:
+        """Зачислить ученика в группу ВД на период (даты «ГГГГ-ММ-ДД»); возвращает новую запись."""
+        return self.post(f"{EC}/ec_group_student", {"begin_date": begin_date, "ec_group_id": ec_group_id,
+                                                     "end_date": end_date, "student_id": student_id})
+
+    def delete_ec_group_student(self, record_id: int) -> None:
+        """Исключить ученика из группы ВД (id записи из :meth:`ec_group_students`)."""
+        self.delete(f"{EC}/ec_group_student/{record_id}")

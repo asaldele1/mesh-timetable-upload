@@ -637,6 +637,44 @@ def run_parallel(fn: Callable, items: Iterable, workers: int, each: Callable[[ob
     return stopped
 
 
+EC_BUSY = "уже существуют уроки в расписании"   # «На данную дату и время у преподавателя, учеников группы ВД или в кабинете …»
+
+
+def create_ec_without_students(client: MeshClient, group_id: int, create: Callable[[], dict], error: MeshError,
+                               restore_errors: list[tuple[str, str]]) -> dict:
+    """Обход ошибки :data:`EC_BUSY`: сервер считает занятыми учеников группы (у них в это время уроки),
+    хотя занятие ВД им не мешает.  Все ученики временно исключаются из группы, занятие создаётся
+    повторно, затем ученики зачисляются обратно с прежними датами — при любом исходе повтора.
+    ``error`` — исходная ошибка.  Не удалось вернуть ученика — запись в ``restore_errors`` (её надо
+    поправить вручную)."""
+    recs = [r for r in client.ec_group_students([group_id]) if r.get("ec_group_id") == group_id and not r.get("deleted_at")]
+    if not recs:
+        raise MeshError(error.status, f"{error.message} (учеников в группе нет — конфликт по учителю или кабинету)",
+                        error.payload) from error
+    log.info("группа ВД %s: сервер считает время занятым — временно исключаем %d учеников и повторяем",
+             group_id, len(recs))
+    removed: list[dict] = []
+    try:
+        for r in recs:
+            client.delete_ec_group_student(r["id"])
+            removed.append(r)
+        try:
+            return create()
+        except MeshError as e:
+            if EC_BUSY in e.message:
+                raise MeshError(e.status, f"{e.message} (и без учеников группы — конфликт по учителю или кабинету)",
+                                e.payload) from e
+            raise
+    finally:
+        for r in removed:
+            try:
+                client.add_ec_group_student(group_id, r["student_id"], r["begin_date"], r["end_date"])
+            except MeshError as e:
+                log.error("группа ВД %s: не удалось вернуть ученика %s: %s", group_id, r["student_id"], e.message)
+                restore_errors.append((f"возврат ученика {r['student_id']} в группу ВД {group_id} "
+                                       f"({r['begin_date']}–{r['end_date']})", e.message))
+
+
 def apply_plan(client: MeshClient, plan: Plan, journal: Journal | None = None,
                stop_on_error: bool = False, progress=None, should_stop: StopCheck | None = None,
                workers: int = 1) -> ApplyResult:
@@ -699,12 +737,29 @@ def apply_plan(client: MeshClient, plan: Plan, journal: Journal | None = None,
     if res.stopped or (stop_on_error and res.errors):
         return res
 
+    group_locks: dict[int, threading.Lock] = {}     # учеников одной группы ВД снимает один поток за раз
+    locks_lock = threading.Lock()
+    restore_errors: list[tuple[str, str]] = []
+
+    def create_ec(p: PlannedItem) -> dict:
+        def once() -> dict:
+            return client.create_ec_item(plan.ec_schedule_id, p.group_id, p.date, p.begin_time, p.end_time,
+                                         p.duration, p.teacher_id, p.room_id, p.building_id)
+        try:
+            return once()
+        except MeshError as e:
+            if EC_BUSY not in e.message:
+                raise
+            with locks_lock:
+                lock = group_locks.setdefault(p.group_id, threading.Lock())
+            with lock:
+                return create_ec_without_students(client, p.group_id, once, e, restore_errors)
+
     def create(p: PlannedItem) -> int:
         if p.kind == "ec":
             if plan.ec_schedule_id is None:
                 raise MeshError(0, f"расписание ВД недели не создано: {ec_error}")
-            created = client.create_ec_item(plan.ec_schedule_id, p.group_id, p.date, p.begin_time, p.end_time,
-                                            p.duration, p.teacher_id, p.room_id, p.building_id)
+            created = create_ec(p)
         else:
             created = client.create_item(plan.schedule_id, p.group_id, p.bell_id, p.date,
                                          p.teacher_id, p.room_id, p.building_id)
@@ -728,6 +783,7 @@ def apply_plan(client: MeshClient, plan: Plan, journal: Journal | None = None,
             res.stopped = True
         elif run_parallel(create, plan.to_create, workers, after_create):
             res.stopped = not (stop_on_error and res.errors)
+    res.errors.extend(restore_errors)
     if failed:
         # ответ мог не дойти (обрыв запроса) или прийти без id, а занятие — создаться: сверяемся с сервером
         existing = {_item_key(it): it for it in fetch_existing(client, plan)}

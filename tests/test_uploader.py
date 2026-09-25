@@ -298,3 +298,71 @@ def test_ec_schedule_id_taken_from_server_not_cache(tmp_path):
     uploader.diff_plan(plan, [], replace=False, rd=rd)
     res = uploader.apply_plan(client, plan)
     assert res.errors == [] and plan.ec_schedule_id == 978 and ("create_ec_schedule", 16) in client.calls
+
+
+BUSY = "На данную дату и время у преподавателя, учеников группы ВД или в кабинете уже существуют уроки в расписании"
+
+
+class StudentsClient(FakeClient):
+    """Заглушка с учениками групп ВД: снятие и зачисление пишутся в calls."""
+
+    def __init__(self, students, add_error=None, **kw):
+        super().__init__(**kw)
+        self.students = list(students)
+        self.add_error = add_error
+
+    def ec_group_students(self, group_ids):
+        return [r for r in self.students if r["ec_group_id"] in group_ids]
+
+    def delete_ec_group_student(self, record_id):
+        self.calls.append(("delete_student", record_id))
+        self.students = [r for r in self.students if r["id"] != record_id]
+
+    def add_ec_group_student(self, group_id, student_id, begin, end):
+        self.calls.append(("add_student", group_id, student_id, begin, end))
+        if self.add_error:
+            raise self.add_error
+
+
+def _ec_only_plan(rd):
+    plan = _plan(rd)
+    uploader.diff_plan(plan, [], replace=False, rd=rd)
+    plan.to_create = [p for p in plan.to_create if p.kind == "ec"]
+    return plan, plan.to_create[0].group_id
+
+
+def _students(gid):
+    return [{"id": 1, "student_id": 501, "ec_group_id": gid, "begin_date": "2026-09-01", "end_date": "2027-08-31",
+             "deleted_at": None},
+            {"id": 2, "student_id": 502, "ec_group_id": gid, "begin_date": "2026-09-01", "end_date": "2027-08-31",
+             "deleted_at": None}]
+
+
+def test_ec_busy_retries_without_students(tmp_path):
+    """«Уже существуют уроки» — ученики группы снимаются, занятие ставится повторно, ученики возвращаются."""
+    plan, gid = _ec_only_plan(_rd())
+    client = StudentsClient(_students(gid), create_responses=[MeshError(400, BUSY), {"id": 7}])
+    journal = Journal(tmp_path / "j.jsonl")
+    res = uploader.apply_plan(client, plan, journal)
+    assert (res.created, res.errors) == (1, [])
+    assert [c[0] for c in client.calls] == ["create_ec_item", "delete_student", "delete_student", "create_ec_item",
+                                            "add_student", "add_student"]
+    assert client.calls[-1] == ("add_student", gid, 502, "2026-09-01", "2027-08-31")
+    assert [r["item_id"] for r in journal.read()] == [7]
+
+
+def test_ec_busy_restores_students_after_failed_retry(tmp_path):
+    plan, gid = _ec_only_plan(_rd())
+    client = StudentsClient(_students(gid), create_responses=[MeshError(400, BUSY), MeshError(400, BUSY)])
+    res = uploader.apply_plan(client, plan, Journal(tmp_path / "j.jsonl"))
+    assert res.created == 0 and "без учеников группы" in res.errors[0][1]
+    assert [c[0] for c in client.calls][-2:] == ["add_student", "add_student"]
+    # учеников нет — повторять нечего
+    client = StudentsClient([], create_responses=[MeshError(400, BUSY)])
+    res = uploader.apply_plan(client, plan, Journal(tmp_path / "j2.jsonl"))
+    assert "учеников в группе нет" in res.errors[0][1] and [c[0] for c in client.calls] == ["create_ec_item"]
+    # ученика вернуть не удалось — отдельная ошибка
+    client = StudentsClient(_students(gid), add_error=MeshError(500, "сбой"),
+                            create_responses=[MeshError(400, BUSY), {"id": 7}])
+    res = uploader.apply_plan(client, plan, Journal(tmp_path / "j3.jsonl"))
+    assert res.created == 1 and [e[0].startswith("возврат ученика") for e in res.errors] == [True, True]
