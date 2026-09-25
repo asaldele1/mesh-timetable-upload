@@ -425,12 +425,13 @@ def pick_teacher(g: dict | None, teacher_id: int | None, forced: int | None = No
     Сервер принимает только учителя, привязанного к группе (удалённые профили из списка группы уже
     убраны), поэтому учитель занятия подходит не всегда.  ``forced`` — принудительная привязка из
     ``Mapping.force_teachers``: она имеет приоритет над сопоставленным учителем.  ``None`` в ответе —
-    занятие в эту группу поставить нельзя.
+    занятие в эту группу поставить нельзя; в том числе в группу без учителей: сервер отвечает «Учитель
+    не привязан к переданной группе».
     """
     ids = group_teacher_ids(g)
-    if forced is not None and (not ids or forced in ids):
+    if forced is not None and forced in ids:
         return forced, "учитель задан принудительно"
-    if teacher_id is not None and (not ids or teacher_id in ids):
+    if teacher_id is not None and teacher_id in ids:
         return teacher_id, ""
     if teacher_id is None and len(ids) == 1:
         return ids[0], "учитель взят из группы"

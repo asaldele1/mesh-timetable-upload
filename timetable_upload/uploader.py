@@ -271,7 +271,9 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
     в группу 1-го приоритета сверх часов.  Часы считаются по всей неделе, даже когда план ограничен датами
     или видом занятий.  ``existing`` — занятия недели на сервере (``fetch_existing``): те из них, что
     останутся после загрузки (все при ``replace=False``; при ``replace=True`` — вне дат плана), тоже
-    занимают часы своих групп.
+    занимают часы своих групп.  День вне плана, в который у класса на сервере остаются занятия этого
+    вида, уже загружен и сейчас не меняется: его часы берутся с сервера, а уроки файла в этот день часов
+    не занимают (иначе загруженная ранее версия дня и версия из файла считались бы вместе).
     """
     sel = sel or Selection()
     sched = rd.schedule_by_week.get(week)
@@ -295,13 +297,16 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
     # когда план попадает в тот же слот
     used: Counter = Counter()
     on_server: set[tuple] = set()
+    loaded_days: set[tuple[int, str, str]] = set()     # (класс, дата, вид), где на сервере остаются занятия
     for it in existing or []:
         k = _item_key(it)
         our = _dt.date.fromisoformat(k[2]) in plan.dates and (plan.only is None or k[0] == plan.only)
-        if replace and our and (cus := _item_classes(it, rd)) and cus <= sel_cu_ids:
+        cus = _item_classes(it, rd)
+        if replace and our and cus and cus <= sel_cu_ids:
             continue                   # будет удалено (или совпадёт с планом и посчитается при постановке)
         on_server.add(k)
         used[k[1]] += 1
+        loaded_days.update((cu_id, k[2], k[0]) for cu_id in cus)
     bells_cache: dict[tuple[int, _dt.date], dict | None] = {}
     resolver = GroupResolver(tt, rd, m)
 
@@ -353,7 +358,7 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
             # убраны): берём сопоставленного, принудительно заданного или единственного учителя группы
             tid, note = resolver.teacher_for(l, link)
             if tid is None:
-                names = ", ".join(t.get("full_name") or "?" for t in g.get("teachers") or []) or "—"
+                names = ", ".join(t.get("full_name") or "?" for t in g.get("teachers") or []) or "нет учителей"
                 not_attached.append(f"«{g['name']}» — {names}")
                 continue
             why = link.why + (f"; {note}" if note else "")
@@ -414,7 +419,10 @@ def build_plan(tt: chngf.Timetable, rd: RefData, m: Mapping, week: int,
             # поток: несколько классов ведут на одну метагруппу — одно занятие
             continue
         seen[item.key] = item
-        if item.key not in on_server:      # занятие с сервера в этом слоте уже посчитано
+        # занятие с сервера в этом слоте уже посчитано; день вне плана, уже загруженный на сервер, посчитан
+        # по серверу целиком
+        if item.key not in on_server and (in_scope(date, item.kind)
+                                          or (cu["id"], date.isoformat(), item.kind) not in loaded_days):
             used[g["id"]] += 1
         if not in_scope(date, item.kind):
             continue

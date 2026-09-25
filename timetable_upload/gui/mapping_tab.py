@@ -651,8 +651,9 @@ class GroupsTab(EntityTab):
             return
         ids = group_teacher_ids(g)
         if not ids:
-            info(self, "Учитель группы МЭШ", f"В группе «{g['name']}» нет учителей — привязывать не к кому; "
-                                             "занятия поставятся от сопоставленного учителя.")
+            info(self, "Учитель группы МЭШ", f"В группе «{g['name']}» нет учителей — привязывать не к кому, "
+                                             "и сервер не примет в неё занятия. Назначьте учителя группе в МЭШ "
+                                             "и обновите справочники.")
             return
         tid = self._resolver.teacher_id(l)
         rows = [([(ctx.rd.teacher_by_id.get(i) or {}).get("name") or "?", ctx.rd.group_hours_span(g, i),

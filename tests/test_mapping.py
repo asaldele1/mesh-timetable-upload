@@ -552,6 +552,39 @@ def test_build_plan_counts_existing_lessons():
     assert plan.unchanged == 2 and len(plan.to_create) == 1
 
 
+def test_build_plan_loaded_day_counted_by_server():
+    """День вне плана уже загружен на сервер по старой версии (урок в другом слоте): его часы берутся с
+    сервера, урок файла в этот день второй раз не считается."""
+    rd = _rd_prio(hours=2)
+    tt = _timetable([_inf(0, lesson=2), _inf(5)])           # в файле: пн 3-й урок, сб 1-й
+    m = _m_prio(names=("Информатика", "Технология"))
+    old_mon = {"id": 5, "group_id": 20, "date": [2025, 12, 15], "bell_id": 7005, "teacher_id": 100, "room_id": 500,
+               "class_unit_id": 1}                        # на сервере: пн 5-й урок
+    sat = uploader.Selection(dates={datetime.date(2025, 12, 20)})
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1), sat, existing=[old_mon], replace=True)
+    assert [(p.group_id, p.priority, p.over_hours) for p in plan.items] == [(20, 1, False)]
+    # на сервере в понедельник у класса ничего нет — день не загружен, часы по файлу (пн + сб = 2)
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1), sat, existing=[], replace=True)
+    assert [(p.group_id, p.over_hours) for p in plan.items] == [(20, False)]
+    # в загруженном понедельнике два урока информатики — часы исчерпаны, суббота во 2-й приоритет
+    two = [old_mon, dict(old_mon, id=6, bell_id=7006)]
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1), sat, existing=two, replace=True)
+    assert [(p.group_id, p.priority) for p in plan.items] == [(21, 2)]
+
+
+def test_group_without_teachers_is_not_attached():
+    """В группу без учителей сервер занятия не принимает — звено пропускается, даже с force_teachers."""
+    rd = _rd_prio()
+    rd.group_by_id[20]["teachers"] = []
+    tt = _timetable([_inf(0)])
+    plan = uploader.build_plan(tt, rd, _m_prio(names=("Информатика", "Технология")), 16, datetime.date(2025, 9, 1))
+    assert [(p.group_id, p.priority) for p in plan.items] == [(21, 2)]
+    m = _m_prio(names=("Информатика",))
+    m.force_teachers["11в|Информатика|0"] = 100
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1))
+    assert plan.items == [] and "«Информатика 11-В 11в» — нет учителей" in plan.skipped[0][1]
+
+
 def test_match_groups_reports_hours():
     rd = _rd_prio()
     lessons = [_inf(0), _inf(1)]
