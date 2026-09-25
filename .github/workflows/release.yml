@@ -2,8 +2,8 @@ name: Release
 
 # Релиз собирается по тегу vX.Y.Z (номер должен совпадать с __version__ в timetable_upload/__init__.py):
 #   git tag v0.1.0 && git push origin v0.1.0
-# Результат: в GitHub Releases появляются архивы с самостоятельными исполняемыми файлами
-# timetable-upload (консоль) и timetable-upload-gui (окно) для Windows и Linux.
+# Результат: в GitHub Releases появляются самостоятельные исполняемые файлы timetable-upload (консоль)
+# и timetable-upload-gui (окно) для Windows и Linux, каждый отдельным файлом.
 
 on:
   push:
@@ -79,23 +79,17 @@ jobs:
 
       - name: Package
         run: |
-          name="timetable-upload-${GITHUB_REF_NAME#v}-${{ matrix.platform }}"
-          mkdir -p "out/$name"
-          cp dist/timetable-upload* "out/$name/"
-          cp README.md "out/$name/"
-          cd out
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a -tzip "../$name.zip" "$name" >/dev/null
-          else
-            tar czf "../$name.tar.gz" "$name"
-          fi
+          # каждый исполняемый файл — отдельным файлом релиза; платформа и версия — в имени
+          ext=""; [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+          mkdir -p out
+          for bin in timetable-upload timetable-upload-gui; do
+            cp "dist/$bin$ext" "out/$bin-${GITHUB_REF_NAME#v}-${{ matrix.platform }}$ext"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform }}
-          path: |
-            timetable-upload-*.zip
-            timetable-upload-*.tar.gz
+          path: out/*
           if-no-files-found: error
 
   release:
