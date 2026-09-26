@@ -480,16 +480,19 @@ class RoomsTab(EntityTab):
 class GroupsTab(EntityTab):
     """Строка на каждую классогруппу и каждый приоритет её предмета (название МЭШ, по которому в классе
     есть группы): уроки недели заполняют группу 1-го приоритета до её часов, затем 2-го и т. д."""
-    headers = ["Класс", "Предмет", "Гр.", "Прио.", "Учитель (двойной щелчок)", "Ур./нед", "Часов/нед", "Состояние",
-               "Группа МЭШ", "Задано вручную (двойной щелчок)", "Как выбрана"]
-    problem_col = 7
-    COL_CLS, COL_SUBJ, COL_GRP, COL_PRIO, COL_TEACHER, COL_N, COL_HOURS, COL_STATUS, COL_MESH, COL_MANUAL, COL_WHY = range(11)
-    stats: Counter = Counter()                 # ok / weak / over / bad / ec по строкам (после заполнения)
+    headers = ["Переносить", "Класс", "Предмет", "Гр.", "Прио.", "Учитель (двойной щелчок)", "Ур./нед", "Часов/нед",
+               "Состояние", "Группа МЭШ", "Задано вручную (двойной щелчок)", "Как выбрана"]
+    problem_col = 8
+    (COL_ON, COL_CLS, COL_SUBJ, COL_GRP, COL_PRIO, COL_TEACHER, COL_N, COL_HOURS, COL_STATUS, COL_MESH, COL_MANUAL,
+     COL_WHY) = range(12)
+    check_cols = (COL_ON,)
+    stats: Counter = Counter()                 # ok / weak / over / bad / off / ec по строкам (после заполнения)
 
     def fill_rows(self, ctx: Ctx):
         seen: dict[str, chngf.Lesson] = {}
         per_week: Counter = Counter()          # (ключ, неделя цикла) → уроков
-        for l in relevant_lessons(ctx.tt, ctx.m):
+        # отвязанные классогруппы тоже показываем — чтобы флажком «Переносить» их можно было вернуть
+        for l in relevant_lessons(ctx.tt, ctx.m, with_ignored_groups=True):
             key = group_key(l)
             seen.setdefault(key, l)
             per_week[(key, l.week)] += 1
@@ -499,15 +502,18 @@ class GroupsTab(EntityTab):
         rows, keys = [], []
         for key, l in seen.items():
             n_les = max(per_week[(key, w)] for w in weeks)
+            on = key not in ctx.m.ignore_groups
             for link in self._resolver.resolve_chain(l):
                 self._rows_by_clsgrp[l.clsgrp_index].append(len(rows))
-                rows.append([Cell(l.cls), Cell(l.subject), Cell(l.group or ""),
+                rows.append([Cell("", on, "снимите отметку, чтобы не переносить занятия этой классогруппы "
+                                          "(отвязать от групп МЭШ)"),
+                             Cell(l.cls), Cell(l.subject), Cell(l.group or ""),
                              Cell(link.prio, link.prio, f"приоритет {link.prio}: {link.name or '—'}"),
                              Cell(l.teacher), Cell(n_les, n_les),
                              Cell(""), Cell(""), Cell(""), Cell(""), Cell("")])
                 keys.append(l)
         self.model.set_rows(rows, keys)
-        self._kinds = [("ok", False)] * len(rows)      # по строкам: (ok | weak | over | bad, группа ВД)
+        self._kinds = [("ok", False)] * len(rows)      # по строкам: (ok | weak | over | bad | off, группа ВД)
         self.refresh_rows(range(len(rows)), self._resolver)     # тот же resolver: цепочки уже посчитаны
 
     def prio_at(self, row: int) -> int:
@@ -537,7 +543,9 @@ class GroupsTab(EntityTab):
                 why += f"; {note}"
             hours = ctx.rd.group_hours_span(g, tid) if g else ""
             n_les = self.value_at(r, self.COL_N)
-            if g is None:
+            if not self.value_at(r, self.COL_ON):
+                kind, status, color = "off", "", COLOR_OFF       # как снятый класс: не проблема
+            elif g is None:
                 kind, status, color = "bad", _short_reason(why), COLOR_BAD
             elif tid is None:
                 # план такую группу пропустит: сервер принимает только учителя, привязанного к группе
@@ -552,6 +560,7 @@ class GroupsTab(EntityTab):
                         why += f"; часов меньше уроков — остальные по приоритету {', '.join(str(lk.prio) for lk in rest)}"
                     else:
                         kind, status, color = "over", "уроков больше часов группы — лишние встанут сверх часов", COLOR_WARN
+            old_kind = self._kinds[r][0]
             self._kinds[r] = (kind, is_ec(g))
             t_text, t_tip = self._teacher_cell(l, prio)
             touched = model.put(r, self.COL_TEACHER, t_text, tip=t_tip)
@@ -560,7 +569,7 @@ class GroupsTab(EntityTab):
             touched |= model.put(r, self.COL_WHY, why, tip=why)
             touched |= model.put(r, self.COL_MANUAL, ctx.group_short(eg) if eg else (f"id {explicit}" if explicit else ""),
                                  explicit, tip=ctx.group_label(eg) if eg else "")
-            if touched or model.text(r, self.COL_STATUS) != status:
+            if touched or model.text(r, self.COL_STATUS) != status or kind != old_kind:
                 self.set_status(r, self.COL_STATUS, status, color)
                 changed.append(r)
         self.stats = Counter(kind for kind, _ in self._kinds)
@@ -577,7 +586,33 @@ class GroupsTab(EntityTab):
         return (f"{l.teacher or '—'} → {name}",
                 f"привязано принудительно: занятия поставятся от учителя МЭШ {name} (id {forced})")
 
+    def on_edited(self, row, col) -> bool:
+        if col != self.COL_ON:
+            return False
+        ctx, l = self.ctx, self.key_at(row)
+        on, key = self.value_at(row, col), group_key(l)
+        if on and key in ctx.m.ignore_groups:
+            ctx.m.ignore_groups.remove(key)
+        elif not on and key not in ctx.m.ignore_groups:
+            ctx.m.ignore_groups.append(key)
+        # флажок общий для всех приоритетов классогруппы — ставим его и в остальных её строках
+        rows_ = self._rows_by_clsgrp.get(l.clsgrp_index, [row])
+        for r in rows_:
+            self.model.cell(r, self.COL_ON).value = on
+        self.model.notify_rows(min(rows_), max(rows_))
+        self.refresh_rows(rows_)
+        if self.search.text().strip() or self.only_problems.isChecked():
+            self.apply_filter()
+        return True
+
+    def _edited(self, row: int, col: int) -> None:
+        # выбор групп других строк от флажка не зависит — перестраивать таблицу не нужно
+        if self.ctx is not None and self.on_edited(row, col):
+            self.owner.mapping_edited(groups_stale=False)
+
     def on_double_clicked(self, row, col):
+        if col == self.COL_ON:
+            return
         if col == self.COL_TEACHER:
             self.force_teacher(row)
             return

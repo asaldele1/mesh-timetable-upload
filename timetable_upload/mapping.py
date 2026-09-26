@@ -29,6 +29,7 @@ class Mapping:
     force_teachers: dict[str, int] = field(default_factory=dict)      # "класс|предмет|группа" → id учителя МЭШ (принудительно)
     ignore_subjects: list[str] = field(default_factory=list)          # предметы, которые не переносим
     ignore_classes: list[str] = field(default_factory=list)
+    ignore_groups: list[str] = field(default_factory=list)            # "класс|предмет|группа" — классогруппы, которые не переносим
     # настройки (значения по умолчанию — из defaults.json, копируются в файл сопоставления при сохранении)
     subject_synonyms: dict[str, list[str]] = field(default_factory=lambda: load_defaults()["subject_synonyms"])  # norm_text(предмет) → названия в МЭШ
     ec_durations: list[int] = field(default_factory=lambda: load_defaults()["ec_durations"])          # длительности занятий ВД, мин
@@ -36,7 +37,7 @@ class Mapping:
     group_ordinal_suffix: str = field(default_factory=lambda: load_defaults()["group_ordinal_suffix"])  # regex номера подгруппы в названии группы
 
     KEYS = ("classes", "subjects", "teachers", "rooms", "room_prefixes", "groups", "force_teachers",
-            "ignore_subjects", "ignore_classes")
+            "ignore_subjects", "ignore_classes", "ignore_groups")
     SETTINGS = ("subject_synonyms", "ec_durations", "ec_course_suffix", "group_ordinal_suffix")
 
     @classmethod
@@ -80,7 +81,7 @@ class Mapping:
             "rooms: кабинет ХроноГрафа → id кабинета в МЭШ.  room_prefixes: префикс кабинета → id здания (для автоподбора).",
             "groups: 'класс|предмет|номер группы' → id группы МЭШ (обычной или внеурочной деятельности) для первого приоритета, 'класс|предмет|номер группы|2' — для второго и т. д.; заполняется только там, где автоматика не справилась, но можно задать и вручную.",
             "force_teachers: ключ как в groups → id учителя МЭШ, от имени которого ставить занятия в привязанной группе; нужен, когда учитель занятия не привязан к выбранной группе МЭШ (сервер принимает только учителя группы).",
-            "ignore_subjects / ignore_classes: что не переносить.",
+            "ignore_subjects / ignore_classes: что не переносить; ignore_groups: классогруппы ('класс|предмет|номер группы', без приоритета), занятия которых не переносить.",
             "subject_synonyms: нормализованное название предмета ХроноГрафа (строчные буквы, без знаков препинания) → названия предметов/курсов МЭШ, которые подставляются при автосопоставлении.",
             "ec_durations: допустимые длительности занятия ВД в минутах; ec_course_suffix: regex хвоста с классами в названии курса ВД; group_ordinal_suffix: regex номера подгруппы («… 2гр») в названии группы МЭШ.",
         ]}
@@ -166,10 +167,14 @@ def match_all(tt: chngf.Timetable, rd: RefData, m: Mapping) -> MatchReport:
     return rep
 
 
-def relevant_lessons(tt: chngf.Timetable, m: Mapping) -> list[chngf.Lesson]:
-    """Занятия, которые подлежат переносу (без игнорируемых классов и предметов)."""
+def relevant_lessons(tt: chngf.Timetable, m: Mapping, with_ignored_groups: bool = False) -> list[chngf.Lesson]:
+    """Занятия, которые подлежат переносу (без игнорируемых классов, предметов и классогрупп).
+    ``with_ignored_groups`` — оставить занятия отвязанных классогрупп (для вкладки «Группы»,
+    где их можно вернуть)."""
+    ignored = set() if with_ignored_groups else set(m.ignore_groups)
     return [l for l in tt.iter_lessons()
-            if l.cls not in m.ignore_classes and l.subject not in m.ignore_subjects]
+            if l.cls not in m.ignore_classes and l.subject not in m.ignore_subjects
+            and (not ignored or group_key(l) not in ignored)]
 
 
 def _used_subjects(lessons) -> Counter:

@@ -480,6 +480,22 @@ def test_build_plan_spills_by_hours():
     assert plan.items == [] and "не привязан" in plan.skipped[0][1] and "«Технология 11-В 11в»" in plan.skipped[0][1]
 
 
+def test_ignore_groups_unbinds_clsgrp(tmp_path):
+    """Отвязанная классогруппа не переносится, остальные подгруппы класса — переносятся."""
+    rd = _rd_prio()
+    ignored, kept = _inf(0), _lesson("11в", "Информатика", 1, "Лебедева А.С.", day=1)
+    tt = _timetable([ignored, kept])
+    m = _m_prio(names=("Информатика",))
+    m.ignore_groups.append("11в|Информатика|0")
+    assert mapping.relevant_lessons(tt, m) == [kept]
+    assert mapping.relevant_lessons(tt, m, with_ignored_groups=True) == [ignored, kept]
+    plan = uploader.build_plan(tt, rd, m, 16, datetime.date(2025, 9, 1))
+    assert [p.lesson for p in plan.items] == [kept] and plan.skipped == []
+    path = tmp_path / "m.json"
+    m.save(path)
+    assert Mapping.load(path).ignore_groups == ["11в|Информатика|0"]
+
+
 def test_force_teacher_binds_group_with_other_teacher():
     """Принудительная привязка: занятие ставится в группу, где учителя занятия нет, от имени учителя группы."""
     rd = _rd_prio()
