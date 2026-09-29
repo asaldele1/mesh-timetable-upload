@@ -132,7 +132,8 @@ class Teacher:
     first_name: str
     middle_name: str
     slots: list[TeacherSlot]
-    day_off: int = -1        # предположительно «методический день» (1..DayCount), -1 — нет
+    max_work_days: int = -1  # «Рабочие дни»: не больше стольких рабочих дней в неделю, -1 — не задано
+    home_cabinet: int = -1   # индекс закреплённого кабинета, -1 — нет
     code: str = ""
     raw_header: list[int] = field(default_factory=list)
 
@@ -182,6 +183,7 @@ class Cls:
     full_name: str
     busy: list[int]          # 2 — класс не может заниматься на уроке
     parallel: int = -1       # номер параллели
+    home_cabinet: int = -1   # индекс закреплённого кабинета, -1 — нет
     man: int = 0             # мальчиков
     woman: int = 0           # девочек
     students: list[Student] = field(default_factory=list)
@@ -449,10 +451,10 @@ def parse_timetable_dat(data: bytes) -> Timetable:
     for i in range(r.i32()):
         r.expect(T_TEACHER, 11, what="Teacher")
         flag = r.u8()
-        day_off = r.i32()
+        max_work_days = r.i32()
         _read_grid_dims(r, dims, "Teacher")
         names = (r.s(), r.s(), r.s())
-        a, b = r.i32(), r.i32()                # назначение неизвестно (в демо: 1/индекс класса, иначе 0/11)
+        a, b = r.i32(), r.i32()                # a = 1 — есть закреплённый кабинет с индексом b (иначе 0/11)
         items = [r.i32() for _ in range(r.i32())]   # список (в демо — [0] у части преподавателей; языки?)
         hdr = [a, b, len(items), r.i32(), r.u8(), r.u8(), r.u8()]
         slots = []
@@ -464,8 +466,9 @@ def parse_timetable_dat(data: bytes) -> Timetable:
             slots.append(TeacherSlot(busy, cab, bool(has)))
         code = r.s()                           # код/табельный номер ('' в новых файлах)
         tail = [r.i32(), r.i32(), r.i32()]     # -1 0 0
-        teachers.append(Teacher(i, *names, slots=slots, day_off=day_off, code=code,
-                                raw_header=[flag, day_off] + hdr + tail))
+        teachers.append(Teacher(i, *names, slots=slots, max_work_days=max_work_days, code=code,
+                                home_cabinet=b if a == 1 else -1,
+                                raw_header=[flag, max_work_days] + hdr + tail))
 
     # --- классогруппы (без сеток)
     clsgrps = []
@@ -485,7 +488,7 @@ def parse_timetable_dat(data: bytes) -> Timetable:
     for i in range(r.i32()):
         r.expect(T_CLS, 11, what="Cls")
         students = [_read_student(r) for _ in range(r.i32())]   # только в «колледж»-классах
-        h1 = [r.i32()]                         # -1
+        h1 = [r.i32()]                         # индекс закреплённого кабинета или -1
         _read_grid_dims(r, dims, "Cls")
         h2 = [r.i32() for _ in range(4)]       # 0 -1 smena? 0
         flag = r.u8()
@@ -498,6 +501,7 @@ def parse_timetable_dat(data: bytes) -> Timetable:
             busy.append(r.i16())
         tail = [r.i32(), r.i32(), r.i32()]
         classes.append(Cls(i, name, full_name, busy, man=man, woman=woman, students=students,
+                           home_cabinet=h1[0],
                            raw_header=h1 + h2 + [flag] + h3 + tail))
 
     # --- параллели
