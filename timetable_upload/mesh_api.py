@@ -7,7 +7,8 @@
 Вход — токен ``aupd_token`` (JWT; в браузере лежит в одноимённой cookie и
 передаётся как ``Authorization: Bearer``).  По нему :meth:`MeshClient.login`
 получает профиль сотрудника (заголовок ``Profile-Id``) и текущий учебный год
-(заголовок ``aid`` и параметр ``academic_year_id``).  Если задан ``refresh``
+(заголовок ``aid`` и параметр ``academic_year_id``).  У сотрудника нескольких школ по учительскому
+профилю на школу; школу для всех запросов задаёт ``Profile-Id`` (так же переключает школу веб-журнал).  Если задан ``refresh``
 (функция, возвращающая новый токен — см. :mod:`auth`), на ответ 401 клиент один
 раз обновляет токен и повторяет запрос.
 """
@@ -43,6 +44,27 @@ class MeshError(RuntimeError):
         self.payload = payload
 
 
+class ProfileChoiceRequired(MeshError):
+    """У пользователя несколько школ, а какую взять, не задано (или заданного профиля больше нет).
+    ``profiles`` — учительские профили из /acl/v1/sessions, по одному на школу."""
+
+    def __init__(self, profiles: list[dict], message: str):
+        super().__init__(403, message + "; " + "; ".join(f"{p['id']} — {school_label(p)}" for p in profiles))
+        self.profiles = profiles
+
+
+def school_label(profile: dict) -> str:
+    """Название школы профиля — как в переключателе школ веб-журнала."""
+    return profile.get("school_shortname") or profile.get("school_name") or f"Школа id {profile.get('school_id')}"
+
+
+def teacher_profiles_of(sessions: dict) -> list[dict]:
+    """Учительские профили из ответа /acl/v1/sessions.  Веб-журнал показывает в выборе школы только
+    профили со school_id; если таких нет вовсе — берём все учительские, как раньше."""
+    teachers = [p for p in (sessions.get("profiles") or []) if str(p.get("type", "")).lower() == "teacher"]
+    return [p for p in teachers if p.get("school_id")] or teachers
+
+
 @dataclass
 class Session:
     profile: dict            # профиль сотрудника из /acl/v1/sessions
@@ -55,6 +77,15 @@ class Session:
     @property
     def academic_year_id(self) -> int:
         return int(self.academic_year["id"])
+
+    @property
+    def school_id(self) -> int | None:
+        sid = self.profile.get("school_id")
+        return int(sid) if sid is not None else None
+
+    @property
+    def school_label(self) -> str:
+        return school_label(self.profile)
 
 
 MAX_WORKERS = 16     # верхняя граница числа параллельных запросов (размер пула соединений)
@@ -83,6 +114,7 @@ class MeshClient:
         self.retries = retries
         self.refresh = refresh
         self.session_info: Session | None = None
+        self.profiles: list[dict] = []      # учительские профили пользователя (по одному на школу), см. login
         self.http = requests.Session()
         adapter = HTTPAdapter(pool_maxsize=MAX_WORKERS)
         self.http.mount("https://", adapter)
@@ -218,24 +250,25 @@ class MeshClient:
         return self.get(f"{CORE}/academic_years", **params)
 
     def login(self, profile_id: int | None = None, academic_year: int | str | None = None) -> Session:
-        """Выбирает профиль сотрудника и учебный год, выставляет заголовки Profile-Id и aid.
+        """Выбирает профиль сотрудника (то есть школу) и учебный год, выставляет заголовки Profile-Id и aid.
 
-        profile_id — если у пользователя несколько профилей сотрудника;
+        profile_id — если у пользователя несколько школ: без него либо с недоступным профилем
+        (сотрудник ушёл из школы) — :class:`ProfileChoiceRequired` со списком профилей;
         academic_year — id либо название («2025/26»); по умолчанию текущий год.
+        Все учительские профили пользователя остаются в ``self.profiles``.
         """
-        data = self.sessions()
-        profiles = [p for p in (data.get("profiles") or []) if str(p.get("type", "")).lower() == "teacher"]
+        profiles = teacher_profiles_of(self.sessions())
         if not profiles:
-            raise MeshError(403, f"по токену нет профилей сотрудника: {data}")
+            raise MeshError(403, "по токену нет профилей сотрудника")
+        self.profiles = profiles
         if profile_id is not None:
-            profile = next((p for p in profiles if int(p["id"]) == profile_id), None)
+            profile = next((p for p in profiles if int(p["id"]) == int(profile_id)), None)
             if profile is None:
-                raise MeshError(403, f"профиль {profile_id} не найден среди {[p['id'] for p in profiles]}")
+                raise ProfileChoiceRequired(profiles, f"профиль {profile_id} недоступен, выберите школу (--profile-id)")
         elif len(profiles) == 1:
             profile = profiles[0]
         else:
-            raise MeshError(403, "несколько профилей сотрудника, укажите --profile-id: "
-                            + "; ".join(f"{p['id']} ({p.get('school_name') or p.get('organization_id')})" for p in profiles))
+            raise ProfileChoiceRequired(profiles, "у пользователя несколько школ, выберите одну (--profile-id)")
         self.http.headers["Profile-Id"] = str(profile["id"])
 
         if academic_year is None:

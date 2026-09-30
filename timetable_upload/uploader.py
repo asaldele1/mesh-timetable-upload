@@ -568,10 +568,12 @@ def journal_key(rec: dict) -> ItemKey:
 
 
 class Journal:
-    """Журнал созданных занятий (JSON Lines) — по нему :func:`undo` удаляет ровно то, что создали мы."""
+    """Журнал созданных занятий (JSON Lines) — по нему :func:`undo` удаляет ровно то, что создали мы.
+    school_id — школа, в которую идёт загрузка: пишется в записи, откат из другой школы их не тронет."""
 
-    def __init__(self, path):
+    def __init__(self, path, school_id: int | None = None):
         self.path = path
+        self.school_id = school_id
         self._lock = threading.Lock()       # запись из нескольких потоков (workers)
 
     def record(self, plan: Plan, item: PlannedItem, item_id: int) -> None:
@@ -583,6 +585,8 @@ class Journal:
                "teacher_id": item.teacher_id, "room_id": item.room_id}
         if item.kind == "ec":
             rec["begin_time"] = item.begin_time
+        if self.school_id is not None:
+            rec["school_id"] = self.school_id
         with self._lock, open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -831,6 +835,12 @@ def undo(client: MeshClient, journal: Journal, weeks: list[int] | None = None,
     records = journal.read()
     todo = [rec for rec in records if journal_matches(rec, weeks, sel) and rec.get("item_id")
             and (items is None or journal_key(rec) in items)]
+    session = getattr(client, "session_info", None)
+    school = session.school_id if session is not None else None
+    foreign = sorted({rec["school_id"] for rec in todo if rec.get("school_id") is not None} - {school})
+    if school is not None and foreign:
+        raise ValueError(f"в журнале занятия другой школы (id {', '.join(map(str, foreign))}), а вход выполнен в школу "
+                         f"{session.school_label} (id {school}): для отката выберите ту школу")
     gone: set[int] = set()      # id() удалённых записей
     done = 0
 

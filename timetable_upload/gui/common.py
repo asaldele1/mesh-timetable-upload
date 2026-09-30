@@ -51,7 +51,8 @@ COLOR_OFF = QColor("#e8e8e8")
 class Worker(QThread):
     """Выполняет функцию в отдельном потоке.  Функция получает ``progress(done, total)``
     и ``message(text)`` для обратной связи; результат приходит в сигнал ``done``.
-    ``cancel`` — событие «остановись»: задача, умеющая останавливаться, опрашивает его между запросами."""
+    ``cancel`` — событие «остановись»: задача, умеющая останавливаться, опрашивает его между запросами.
+    ``exc`` — исключение упавшей задачи (сигнал ``failed`` несёт только текст)."""
     done = Signal(object)
     failed = Signal(str)
     progress = Signal(int, int)
@@ -61,12 +62,14 @@ class Worker(QThread):
         super().__init__(parent)
         self.fn = fn
         self.cancel = threading.Event()
+        self.exc: Exception | None = None
 
     def run(self):
         try:
             result = self.fn(self.progress.emit, self.message.emit)
         except Exception as e:  # любая ошибка задачи показывается пользователю
             logging.getLogger(__name__).debug("ошибка задачи:\n%s", traceback.format_exc())
+            self.exc = e
             self.failed.emit(str(e))
             return
         self.done.emit(result)

@@ -21,7 +21,7 @@ FETCH_WORKERS = 6        # параллельных запросов при за
 
 FILES = ("schedules", "groups", "class_units", "rooms", "teacher_profiles",
          "bells_timetable_assignments", "bells_timetables", "class_levels", "academic_year",
-         "ec_activities", "ec_groups", "ec_schedules")
+         "ec_activities", "ec_groups", "ec_schedules", "school")
 
 
 
@@ -74,6 +74,7 @@ class RefData:
     bells_timetables: list = field(default_factory=list)
     class_levels: list = field(default_factory=list)
     academic_year: dict = field(default_factory=dict)   # учебный год, к которому относится кэш
+    school: dict = field(default_factory=dict)          # школа кэша: school_id, school_shortname, profile_id
     ec_activities: list = field(default_factory=list)   # курсы внеурочной деятельности
     ec_groups: list = field(default_factory=list)       # группы ВД (как отдаёт сервер)
     ec_schedules: list = field(default_factory=list)    # расписания ВД по неделям
@@ -104,6 +105,7 @@ class RefData:
     def summary(self) -> str:
         ay = self.academic_year
         return ((f"загружено {self.fetched_at:%d.%m.%Y %H:%M}; " if self.fetched_at else "")
+                + (f"школа {self.school['school_shortname']}; " if self.school.get("school_shortname") else "")
                 + f"учебный год {ay.get('name', '?')} (id {ay.get('id', '?')}): "
                 f"недель: {len(self.schedules)}, групп: {len(self.groups)}, классов: {len(self.class_units)}, "
                 f"кабинетов: {len(self.rooms)}, учителей: {len(self.teachers)}"
@@ -186,14 +188,28 @@ class RefData:
         vals = vals - {0} or {0}
         return str(min(vals)) if len(vals) == 1 else f"{min(vals)}–{max(vals)}"
 
-    def check_academic_year(self, client: MeshClient) -> None:
-        """Кэш должен относиться к учебному году сессии: id недель, групп и звонков в разных годах разные,
-        и запись с чужими id уйдёт не туда либо будет отвергнута сервером."""
+    @property
+    def school_id(self) -> int | None:
+        """Школа, к которой относится кэш (у кэша прежних версий — по классам)."""
+        sid = self.school.get("school_id")
+        if sid is None:
+            sid = next((c["school_id"] for c in self.class_units if c.get("school_id") is not None), None)
+        return int(sid) if sid is not None else None
+
+    def check_session(self, client: MeshClient) -> None:
+        """Кэш должен относиться к школе и учебному году сессии: id недель, групп и звонков у разных школ
+        и в разных годах разные, и запись с чужими id уйдёт не туда либо будет отвергнута сервером."""
+        s = client.session_info
+        cached = self.school_id
+        if cached is not None and s.school_id is not None and cached != s.school_id:
+            raise ValueError(f"кэш справочников относится к другой школе ({self.school.get('school_shortname') or f'id {cached}'}), "
+                             f"а вход выполнен в школу {s.school_label} (id {s.school_id}): "
+                             "загрузите справочники заново либо выберите ту школу")
         cached = self.academic_year.get("id")
         if cached is None or int(cached) == client.ay:
             return
         raise ValueError(f"кэш справочников относится к учебному году {self.academic_year.get('name')} (id {cached}), "
-                         f"а вход выполнен в год {client.session_info.academic_year.get('name')} (id {client.ay}): "
+                         f"а вход выполнен в год {s.academic_year.get('name')} (id {client.ay}): "
                          "загрузите справочники заново либо укажите тот же учебный год при входе")
 
     # ------------------------------------------------------------------ поиск
@@ -245,7 +261,9 @@ def fetch(client: MeshClient, cache_dir, class_level_ids: list[int] | None = Non
     (группы — самый долгий, их страницы тоже идут параллельно, см. ``MeshClient.get_pages``);
     в кэш попадает только полный набор: при ошибке любого запроса старый кэш остаётся."""
     rd = RefData()
-    rd.academic_year = client.session_info.academic_year
+    s = client.session_info
+    rd.academic_year = s.academic_year
+    rd.school = {"school_id": s.school_id, "school_shortname": s.school_label, "profile_id": s.profile_id}
 
     def by_levels(fn):
         def run():
@@ -273,3 +291,20 @@ def fetch(client: MeshClient, cache_dir, class_level_ids: list[int] | None = Non
     rd.save(cache_dir)
     rd._index()
     return rd
+
+
+def cached_school_id(cache_dir) -> int | None:
+    """Школа кэша справочников на диске, не читая его целиком (school.json либо классы); нет кэша — None."""
+    for name in ("school", "class_units"):
+        p = os.path.join(cache_dir, name + ".json")
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        rd = RefData(school=data) if name == "school" else RefData(class_units=data if isinstance(data, list) else [])
+        if rd.school_id is not None:
+            return rd.school_id
+    return None

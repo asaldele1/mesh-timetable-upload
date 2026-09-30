@@ -7,17 +7,19 @@ import csv
 import datetime as _dt
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict
 
-from . import auth, chngf, export, paths, refdata, uploader
+from . import auth, chngf, export, paths, refdata, schools, uploader
 from .mapping import Mapping, match_all
-from .mesh_api import MAX_WORKERS, MeshClient, MeshError, fmt_roles
+from .mesh_api import MAX_WORKERS, MeshClient, MeshError, fmt_roles, school_label
 from .uploader import DAYS, Journal
 
 TOKEN_ENV = auth.TOKEN_ENV
 CLASSES_HELP = "классы через запятую: имена (5а,5б), параллель целиком (5), шаблон (10*); по умолчанию все"
 DAYS_HELP = "дни недели через запятую: пн,ср | 1-3 | пн-пт; по умолчанию все"
+SCHOOL_DEFAULT = "в папке выбранной школы: <папка данных>/schools/<id школы>/"
 
 
 def parse_weeks(spec: str) -> list[int]:
@@ -58,19 +60,48 @@ def week1(args, tt: chngf.Timetable | None, rd: refdata.RefData | None = None) -
                                      rd.academic_year if rd else None)
 
 
+def resolve_school_paths(args) -> None:
+    """Школа команды — из --profile-id (по списку профилей с последнего входа) либо выбранная ранее;
+    незаданные --cache/--mapping/--journal — файлы этой школы в папке данных (см. :mod:`schools`)."""
+    cur = schools.load_current()
+    pid = getattr(args, "profile_id", None)
+    args.school_id = cur.school_of(pid) if pid is not None else cur.school_id
+    if args.school_id is not None:
+        schools.migrate_legacy(args.school_id, len(cur.profiles))
+    args.default_paths = set()
+    for key in schools.KEYS:
+        if hasattr(args, key) and getattr(args, key) is None:
+            setattr(args, key, schools.default_path(key, args.school_id))
+            args.default_paths.add(key)
+
+
 def make_client(args, rd: refdata.RefData | None = None) -> MeshClient:
     """Клиент по токену из --token-file (или переменной MESH_TOKEN) с выполненным входом.
     Истекающий токен обновляется по refresh-токену (см. auth); то же при ответе 401.
-    rd — кэш справочников, с которым будет работать клиент: его учебный год должен совпадать с годом входа."""
+    Школа — --profile-id либо выбранная ранее (в окне или прошлой командой); школа, выбранная без
+    --profile-id (единственная у пользователя), запоминается.
+    rd — кэш справочников, с которым будет работать клиент: его школа и учебный год должны совпадать со входом."""
     token = auth.current_token(args.token_file)
     client = MeshClient(token, delay=getattr(args, "delay", 0),
                         refresh=lambda: auth.current_token(args.token_file, force=True))
-    s = client.login(profile_id=args.profile_id, academic_year=args.academic_year)
-    logging.getLogger(__name__).info("профиль %s (%s), учебный год %s (id %s)",
-                                     s.profile_id, s.profile.get("name") or s.profile.get("school_name"),
-                                     s.academic_year.get("name"), s.academic_year_id)
+    cur = schools.load_current()
+    s = client.login(profile_id=args.profile_id if args.profile_id is not None else cur.profile_id,
+                     academic_year=args.academic_year)
+    if args.profile_id is None or cur.profile_id is None:
+        schools.remember(s.profile, client.profiles)
+    logging.getLogger(__name__).info("школа %s (профиль %s), учебный год %s (id %s)",
+                                     s.school_label, s.profile_id, s.academic_year.get("name"), s.academic_year_id)
+    if s.school_id != getattr(args, "school_id", s.school_id):
+        # файлы брались для другой школы: годится, только если это были общие файлы прежней версии этой же школы
+        if args.default_paths and (args.school_id is not None or schools.legacy_owner() not in (None, s.school_id)):
+            raise ValueError(f"файлы (кэш, сопоставление, журнал) взяты для другой школы, а вход выполнен в школу "
+                             f"{s.school_label}: повторите команду")
+        schools.migrate_legacy(s.school_id, len(client.profiles))
+        args.school_id = s.school_id
+        for key in args.default_paths:
+            setattr(args, key, schools.default_path(key, s.school_id))
     if rd is not None:
-        rd.check_academic_year(client)
+        rd.check_session(client)
     return client
 
 
@@ -131,6 +162,10 @@ def cmd_check_auth(args):
     print("Срок действия:", auth.describe(args.token_file))
     s = client.session_info
     print("Профиль:", json.dumps(s.profile, ensure_ascii=False))
+    if len(client.profiles) > 1:
+        print("Школы пользователя (выбор — --profile-id):")
+        for p in client.profiles:
+            print(f"  {'*' if int(p['id']) == s.profile_id else ' '} {p['id']} — {school_label(p)}")
     print("Учебный год:", json.dumps(s.academic_year, ensure_ascii=False))
     print("Все учебные годы:", ", ".join(f"{y.get('name')} (id {y.get('id')})" for y in client.academic_years()))
     p = client.teacher_profile()
@@ -213,7 +248,7 @@ def _fresh_refdata(args, client, m: Mapping, rd: refdata.RefData) -> refdata.Ref
     """Перед работой с сервером — свежие справочники (как делает GUI при запуске): id недель ВД,
     учителя и составы групп меняются, а старый кэш ведёт к «висящим» занятиям.  --no-refresh — по кэшу."""
     if getattr(args, "no_refresh", False):
-        rd.check_academic_year(client)
+        rd.check_session(client)
         return rd
     print("Обновление справочников с сервера…", end="", flush=True)
     rd = refdata.fetch(client, args.cache, None)
@@ -248,7 +283,7 @@ def cmd_upload(args):
     client = make_client(args)
     rd = _fresh_refdata(args, client, m, rd)
     w1 = week1(args, tt, rd)
-    journal = Journal(args.journal)
+    journal = Journal(args.journal, client.session_info.school_id)
     total_err = 0
     sel = selection(args, tt)
     for week in weeks_for(args, sel, w1):
@@ -292,6 +327,7 @@ def cmd_undo(args):
         print("  (пробный прогон; добавьте --apply, чтобы удалить)")
         return
     client = make_client(args)
+    journal = Journal(args.journal)      # путь мог смениться: при первом входе журнал переезжает в папку школы
     res = uploader.undo(client, journal, weeks, sel, workers=args.workers)
     print(f"Удалено {res.deleted}, ошибок {len(res.errors)}")
     for what, msg in res.errors:
@@ -328,7 +364,16 @@ def cmd_login(args):
 
 
 def cmd_paths(args):
-    for what, path, exists in paths.describe():
+    cur = schools.load_current()
+    items = paths.describe()
+    if cur.school_id is not None:
+        # кэш, сопоставление и журнал — выбранной школы
+        own = {"кэш справочников МЭШ": "cache", "сопоставление": "mapping", "журнал загрузок": "journal"}
+        items = [(what, schools.default_path(own[what], cur.school_id), None) if what in own else (what, p, e)
+                 for what, p, e in items]
+        items = [(what, p, os.path.exists(p) if e is None else e) for what, p, e in items]
+        print(f"Школа: {cur.label} (профиль {cur.profile_id})")
+    for what, path, exists in items:
         print(f"{what:24} {path}{'' if exists else '   (нет)'}")
     print(f"Другая папка: переменная {paths.HOME_ENV}")
 
@@ -343,7 +388,9 @@ def build_parser() -> argparse.ArgumentParser:
     def auth(p):
         p.add_argument("--token-file", default=paths.token_file(),
                        help=f"файл с aupd_token (по умолчанию {paths.token_file()}; либо переменная {TOKEN_ENV})")
-        p.add_argument("--profile-id", type=int, help="id профиля сотрудника, если их несколько")
+        p.add_argument("--profile-id", type=int,
+                       help="id профиля сотрудника — выбор школы, если их несколько (список — check-auth); "
+                            "по умолчанию выбранная ранее")
         p.add_argument("--academic-year", help="учебный год: id или название («2025/26»); по умолчанию текущий")
         p.add_argument("--delay", type=float, default=0, help="пауза между запросами, с (по умолчанию нет; при 429 сервер и так ждём)")
 
@@ -352,14 +399,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help=f"сколько запросов слать одновременно, 1–{MAX_WORKERS} (по умолчанию 8)")
 
     def cache(p):
-        p.add_argument("--cache", default=paths.cache_dir(),
-                       help=f"каталог кэша справочников МЭШ (по умолчанию {paths.cache_dir()})")
+        p.add_argument("--cache", help=f"каталог кэша справочников МЭШ (по умолчанию {SCHOOL_DEFAULT} cache)")
 
     def inputs(p):
         p.add_argument("file", help="файл расписания .chngf")
         cache(p)
-        p.add_argument("--mapping", default=paths.mapping_file(),
-                       help=f"файл сопоставления (по умолчанию {paths.mapping_file()})")
+        p.add_argument("--mapping", help=f"файл сопоставления (по умолчанию {SCHOOL_DEFAULT} mapping.json)")
 
     def selection(p, classes_help=CLASSES_HELP):
         p.add_argument("--weeks", help="номера учебных недель: 16 | 16-20 | 16,18-20 (можно вместо этого --dates)")
@@ -431,13 +476,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--apply", action="store_true", help="действительно выполнить изменения")
     p.add_argument("--stop-on-error", action="store_true", help="остановиться на первой ошибке")
     workers(p)
-    p.add_argument("--journal", default=paths.journal_file(),
-                   help=f"журнал созданных занятий для undo (по умолчанию {paths.journal_file()})")
+    p.add_argument("--journal", help=f"журнал созданных занятий для undo (по умолчанию {SCHOOL_DEFAULT} upload.journal.jsonl)")
     p.set_defaults(fn=cmd_upload)
 
     p = sub.add_parser("undo", help="удалить занятия, созданные командой upload (по журналу)")
     auth(p)
-    p.add_argument("--journal", default=paths.journal_file())
+    p.add_argument("--journal", help=f"журнал созданных занятий (по умолчанию {SCHOOL_DEFAULT} upload.journal.jsonl)")
     workers(p)
     selection(p, classes_help="классы через запятую, как они названы в файле ХроноГрафа")
     p.add_argument("--apply", action="store_true", help="действительно удалить")
@@ -465,6 +509,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
     try:
+        resolve_school_paths(args)
         args.fn(args)
     except (chngf.ChngfError, MeshError, ValueError, FileNotFoundError) as e:   # AuthError — тоже ValueError
         print("Ошибка:", e, file=sys.stderr)

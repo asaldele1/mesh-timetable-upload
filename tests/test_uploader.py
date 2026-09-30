@@ -149,20 +149,59 @@ def test_journal_keys_distinguish_kinds(tmp_path):
     assert [journal_key(r) for r in journal.read()] == [("oo", 5)]
 
 
-def test_check_academic_year():
+def _session(school_id=1234, year="2026/27", profile_id=1):
+    from timetable_upload.mesh_api import Session
+    return Session({"id": profile_id, "school_id": school_id, "school_shortname": f"Школа {school_id}"},
+                   {"id": 14, "name": year})
+
+
+def test_check_session_year():
     rd = _rd()
     rd.academic_year = {"id": 13, "name": "2025/26"}
 
     class C:
         ay = 14
-        session_info = type("S", (), {"academic_year": {"name": "2026/27"}})()
+        session_info = _session()
 
     with pytest.raises(ValueError, match="2025/26"):
-        rd.check_academic_year(C())
+        rd.check_session(C())
     C.ay = 13
-    rd.check_academic_year(C())
+    rd.check_session(C())
     rd.academic_year = {}
-    rd.check_academic_year(C())       # старый кэш без года — не проверяем
+    rd.check_session(C())       # старый кэш без года — не проверяем
+
+
+def test_check_session_school():
+    """Кэш другой школы не годится; у кэша прежней версии школа — по классам."""
+    rd = _rd()
+
+    class C:
+        ay = 14
+        session_info = _session(school_id=1234)
+
+    rd.check_session(C())                          # школа кэша неизвестна — не проверяем
+    rd.class_units = [{"id": 1, "school_id": 900}]
+    with pytest.raises(ValueError, match="другой школе"):
+        rd.check_session(C())
+    rd.school = {"school_id": 1234, "school_shortname": "Школа 1234"}
+    rd.check_session(C())
+
+
+def test_undo_refuses_other_school(tmp_path):
+    """Записи журнала помечены школой; откат из другой школы их не удаляет."""
+    rd = _rd()
+    plan = _plan(rd)
+    journal = Journal(tmp_path / "j.jsonl", school_id=1234)
+    journal.record(plan, plan.items[0], 5)
+    assert journal.read()[0]["school_id"] == 1234
+
+    client = FakeClient()
+    client.session_info = _session(school_id=900)
+    with pytest.raises(ValueError, match="другой школы"):
+        uploader.undo(client, journal)
+    assert client.calls == [] and len(journal.read()) == 1
+    client.session_info = _session(school_id=1234)
+    assert uploader.undo(client, journal).deleted == 1
 
 
 def test_stop_keeps_done_work_and_journal(tmp_path):

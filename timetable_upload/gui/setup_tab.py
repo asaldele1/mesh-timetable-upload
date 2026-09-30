@@ -1,6 +1,6 @@
 """Вкладка «Данные и вход»: файл расписания, вход в МЭШ, загрузка справочников.
 
-Редко нужное (токен вручную, профиль и учебный год, пути к файлам программы) убрано в окно
+Редко нужное (токен вручную, учебный год, пути к файлам программы) убрано в окно
 «Дополнительно…», чтобы основная вкладка целиком помещалась на невысоком экране."""
 
 from __future__ import annotations
@@ -9,12 +9,15 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
@@ -22,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import auth, paths
-from ..mesh_api import fmt_roles
+from ..mesh_api import fmt_roles, school_label
 from .common import error, info, scrollable
 
 
@@ -91,6 +94,41 @@ class PathRow(QWidget):
             self._commit()
 
 
+class SchoolDialog(QDialog):
+    """Выбор школы, если у пользователя их несколько (как переключатель школ в шапке веб-журнала МЭШ)."""
+
+    def __init__(self, parent, profiles: list[dict], current_id: int | None = None, reason: str = ""):
+        super().__init__(parent)
+        self.profiles = profiles
+        self.setWindowTitle("Выбор школы")
+        self.setMinimumWidth(520)
+        lay = QVBoxLayout(self)
+        lab = QLabel(reason or "У вас доступ к нескольким школам. Выберите, с какой работать:")
+        lab.setWordWrap(True)
+        lay.addWidget(lab)
+        self.list = QListWidget()
+        for i, p in enumerate(profiles):
+            it = QListWidgetItem(school_label(p))
+            it.setToolTip(f"{p.get('school_name') or school_label(p)}\nпрофиль {p['id']}, роли {fmt_roles(p.get('roles'))}")
+            self.list.addItem(it)
+            if current_id is not None and int(p["id"]) == int(current_id):
+                self.list.setCurrentRow(i)
+        if self.list.currentRow() < 0:
+            self.list.setCurrentRow(0)
+        self.list.itemDoubleClicked.connect(self.accept)
+        lay.addWidget(self.list)
+        lay.addWidget(gray_hint("Кэш справочников, сопоставление и журнал загрузок у каждой школы свои; "
+                                "школу можно сменить позже на вкладке «Данные и вход»."))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Выбрать")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def chosen(self) -> dict:
+        return self.profiles[self.list.currentRow()]
+
+
 class SetupTab(QWidget):
     def __init__(self, app):
         super().__init__()
@@ -135,6 +173,15 @@ class SetupTab(QWidget):
         row.addWidget(self.auth_label, 1)
         form.addRow("Вход:", row)
         row = QHBoxLayout()
+        self.school_label = QLabel("")
+        self.school_label.setWordWrap(True)
+        row.addWidget(self.school_label, 1)
+        self.school_btn = QPushButton("Сменить школу…")
+        self.school_btn.setToolTip("У каждой школы свои кэш справочников, сопоставление и журнал загрузок")
+        self.school_btn.clicked.connect(self.change_school)
+        row.addWidget(self.school_btn)
+        form.addRow("Школа:", row)
+        row = QHBoxLayout()
         b = QPushButton("Загрузить справочники из МЭШ (только чтение)")
         b.setToolTip("Классы, группы, учителя, кабинеты, звонки, недели, ВД — в кэш на диске. Загружаются сами "
                      "при каждом запуске и после входа; кнопка — чтобы повторить после изменений в МЭШ")
@@ -148,7 +195,7 @@ class SetupTab(QWidget):
 
         # ---- редко нужное
         row = QHBoxLayout()
-        row.addWidget(gray_hint("Токен вручную, профиль сотрудника и учебный год, папка данных и пути к файлам программы:"), 1)
+        row.addWidget(gray_hint("Токен вручную, учебный год, папка данных и пути к файлам программы:"), 1)
         b = QPushButton("Дополнительно…")
         b.clicked.connect(self.show_advanced)
         row.addWidget(b)
@@ -158,6 +205,7 @@ class SetupTab(QWidget):
         st.changed.connect(self._on_changed)
         self._on_changed("file")
         self._on_changed("refdata")
+        self._on_changed("session")
 
     # ------------------------------------------------------------------ обработчики
     def _on_changed(self, what: str):
@@ -176,6 +224,12 @@ class SetupTab(QWidget):
             self.cache_label.setText(text)
         elif what in ("session", "paths"):
             self.auth_label.setText(self._auth_text())
+            cur = self.state.school
+            self.school_label.setText(cur.label or "определится при входе")
+            self.school_btn.setVisible(len(cur.profiles) > 1)
+
+    def change_school(self):
+        self.app.pick_school(self.state.school.profiles)      # другая школа — справочники загрузятся сами
 
     def _auth_text(self) -> str:
         return self.state.session_text or ("вход не проверялся; " + auth.describe(self.state.paths["token_file"] or None))
@@ -237,14 +291,14 @@ class SetupTab(QWidget):
             self.auth_label.setText(text)
             self.app.start_refresh()        # вход (возможно, другой) — справочники с сервера заново
 
-        self.app.run(job, done, "Проверка входа")
+        self.app.run(job, done, "Проверка входа", retry=self.check_auth)
 
     def fetch_refdata(self):
         self.app.start_refresh(manual=True)
 
 
 class AdvancedDialog(QDialog):
-    """Окно «Дополнительно…»: токен вручную, профиль и учебный год, папка данных и пути к файлам программы.
+    """Окно «Дополнительно…»: токен вручную, учебный год, папка данных и пути к файлам программы.
 
     Поля пишут в состояние сразу (как и на вкладке), так что кнопка одна — «Закрыть»."""
 
@@ -272,8 +326,6 @@ class AdvancedDialog(QDialog):
         form.addRow("", gray_hint("если окно входа mos.ru недоступно; такой токен живёт сутки и сам не обновляется"))
         self.token_row = PathRow(st, "token_file", "save", "Текст (*.txt);;Все файлы (*)", st.forget_client)
         form.addRow("Файл с токеном:", self.token_row)
-        self.profile_edit = QLineEdit(st.paths["profile_id"])
-        self.profile_edit.editingFinished.connect(lambda: (st.set_path("profile_id", self.profile_edit.text()), st.forget_client()))
         self.year_edit = QLineEdit(st.paths["academic_year"])
         self.year_edit.setPlaceholderText("текущий")
         self.year_edit.editingFinished.connect(lambda: (st.set_path("academic_year", self.year_edit.text()), st.forget_client()))
@@ -281,7 +333,6 @@ class AdvancedDialog(QDialog):
         self.week1_edit.setPlaceholderText("ГГГГ-ММ-ДД")
         self.week1_edit.editingFinished.connect(lambda: (st.set_path("week1_monday", self.week1_edit.text()), st.changed.emit("refdata")))
         for label, edit, tip in (
-            ("Id профиля сотрудника:", self.profile_edit, "только если у сотрудника несколько профилей"),
             ("Учебный год:", self.year_edit, "например 2025/26; пусто — текущий"),
             ("Понедельник 1-й учебной недели:", self.week1_edit, "ГГГГ-ММ-ДД; пусто — по началу учебного года в МЭШ"),
         ):
@@ -312,8 +363,8 @@ class AdvancedDialog(QDialog):
         b.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(paths.data_dir())))
         row.addWidget(b)
         form.addRow("Папка данных:", row)
-        form.addRow("", gray_hint("кэш справочников, сопоставление, токены, журнал, логи, сессия браузера; "
-                                  "пути ниже менять обычно не нужно"))
+        form.addRow("", gray_hint("токены, логи, сессия браузера; кэш справочников, сопоставление и журнал — "
+                                  "в папке школы (schools/<id школы>), пути ниже менять обычно не нужно"))
         self.mapping_row = PathRow(st, "mapping", "save", "JSON (*.json)", tab.load_mapping)
         form.addRow("Сопоставление (mapping.json):", self.mapping_row)
         self.cache_row = PathRow(st, "cache", "dir", "", tab.load_refdata)

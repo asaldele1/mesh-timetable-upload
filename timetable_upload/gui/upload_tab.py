@@ -515,7 +515,7 @@ class UploadTab(QWidget):
 
         def job(progress, message):
             client = st.get_client_for_refdata()
-            journal = Journal(journal_path)
+            journal = Journal(journal_path, client.session_info.school_id)
             total = sum(len(p.to_create) + len(p.to_delete) for p in plans)
             base = 0
             results = []

@@ -8,25 +8,34 @@ import os
 
 from PySide6.QtCore import QObject, QSettings, Signal
 
-from .. import auth, chngf, paths, refdata, uploader
+from .. import auth, chngf, paths, refdata, schools, uploader
 from ..mapping import Mapping
-from ..mesh_api import MAX_WORKERS, MeshClient
+from ..mesh_api import MAX_WORKERS, MeshClient, MeshError
 
 log = logging.getLogger(__name__)
 
 
-def default_paths() -> dict[str, str]:
-    """Пути по умолчанию — в папке данных программы (см. paths.data_dir)."""
+def default_paths(school_id: int | None = None) -> dict[str, str]:
+    """Пути по умолчанию — в папке данных программы (см. paths.data_dir); кэш, сопоставление и журнал —
+    в папке школы (см. schools)."""
     return {
         "file": "",
-        "cache": paths.cache_dir(),
-        "mapping": paths.mapping_file(),
+        "cache": schools.default_path("cache", school_id),
+        "mapping": schools.default_path("mapping", school_id),
         "token_file": paths.token_file(),
-        "journal": paths.journal_file(),
-        "profile_id": "",
+        "journal": schools.default_path("journal", school_id),
         "academic_year": "",
         "week1_monday": "",
     }
+
+
+class SchoolChanged(MeshError):
+    """Вход выполнен не в ту школу, под которую открыты файлы (первый вход, сменился список школ):
+    переключить школу нужно в главном потоке (:meth:`AppState.choose_school`), затем повторить."""
+
+    def __init__(self, profile: dict, profiles: list[dict]):
+        super().__init__(409, "сменилась школа входа — повторите действие")
+        self.profile, self.profiles = profile, profiles
 
 
 DEFAULT_WORKERS = 8
@@ -43,7 +52,16 @@ class AppState(QObject):
     def __init__(self):
         super().__init__()
         self.settings = QSettings("timetable_upload", "gui")
-        self.paths: dict[str, str] = {k: str(self.settings.value("paths/" + k, v)) for k, v in default_paths().items()}
+        self.school = schools.load_current()
+        old_pid = str(self.settings.value("paths/profile_id", "")).strip()   # прежняя версия: профиль вписывали руками
+        if self.school.profile_id is None and old_pid.isdigit():
+            self.school.profile_id = int(old_pid)       # станет выбранной школой при первом входе
+        self.school_id = self.school.school_id           # школа, под которую открыты кэш, сопоставление и журнал
+        defaults = default_paths(self.school_id)
+        self.paths: dict[str, str] = {k: str(self.settings.value("paths/" + k, v)) for k, v in defaults.items()}
+        for key in schools.KEYS:          # стандартные пути (в т.ч. прежние общие) следуют за школой
+            if schools.is_default_path(key, self.paths[key]):
+                self.paths[key] = defaults[key]
         self.tt: chngf.Timetable | None = None
         self.rd: refdata.RefData | None = None
         self.m: Mapping = Mapping()
@@ -74,17 +92,46 @@ class AppState(QObject):
         if self.paths.get(key) == value:
             return
         self.paths[key] = value
-        self.settings.setValue("paths/" + key, value)
+        # стандартный путь файла школы хранится пустым: при смене школы он сменится вместе с ней
+        self.settings.setValue("paths/" + key, "" if key in schools.KEYS and schools.is_default_path(key, value) else value)
         self.changed.emit("paths")
 
     def reset_paths(self) -> None:
-        """Вернуть стандартные пути к файлам программы (папка данных); файл расписания и настройки
-        входа (профиль, год, первая неделя) не трогаются."""
-        for k, v in default_paths().items():
+        """Вернуть стандартные пути к файлам программы (папка данных, файлы школы — в её папке); файл
+        расписания и настройки входа (год, первая неделя) не трогаются."""
+        for k, v in default_paths(self.school_id).items():
             if k in ("cache", "mapping", "token_file", "journal"):
                 self.paths[k] = v
-                self.settings.setValue("paths/" + k, v)
+                self.settings.setValue("paths/" + k, "" if k in schools.KEYS else v)
         self.changed.emit("paths")
+
+    # ------------------------------------------------------------------ школа
+    def choose_school(self, profile: dict, profiles: list[dict]) -> None:
+        """Выбрать школу (её учительский профиль) — вызывать в главном потоке.  Другая школа — стандартные
+        пути переходят в её папку (данные прежней версии переезжают туда при первом входе), кэш,
+        сопоставление и журнал перечитываются, вход — заново.  Несохранённое сопоставление вызывающий
+        должен сохранить или отбросить заранее."""
+        self.school = schools.remember(profile, profiles)
+        if self.school.school_id != self.school_id:
+            old = self.school_id
+            schools.migrate_legacy(self.school.school_id, len(profiles))
+            self.school_id = self.school.school_id
+            for key in schools.KEYS:
+                if schools.is_default_path(key, self.paths[key]):
+                    self.paths[key] = schools.default_path(key, self.school_id)
+            log.info("школа: %s (профиль %s)%s", self.school.label, self.school.profile_id,
+                     "" if old is None else f", файлы — {schools.school_dir(self.school_id)}")
+            self.forget_client()
+            self.changed.emit("paths")
+            for load, what in ((self.load_mapping, "сопоставление"), (self.load_refdata, "кэш")):
+                try:
+                    load()
+                except Exception as e:
+                    log.error("%s: %s", what, e)
+            self.changed.emit("journal")
+        elif self.client is not None and self.client.session_info.profile_id != self.school.profile_id:
+            self.forget_client()
+        self.changed.emit("session")
 
     # ------------------------------------------------------------------ загрузка данных (локально)
     def load_file(self) -> chngf.Timetable:
@@ -155,26 +202,27 @@ class AppState(QObject):
             return self.client
         token_file = self.paths["token_file"] or paths.token_file()
         client = MeshClient(token, refresh=lambda: auth.current_token(token_file, force=True))
-        pid = int(self.paths["profile_id"]) if self.paths["profile_id"].strip() else None
         ay = self.paths["academic_year"].strip() or None
-        s = client.login(profile_id=pid, academic_year=ay)
+        s = client.login(profile_id=self.school.profile_id, academic_year=ay)    # несколько школ без выбора — ProfileChoiceRequired
+        if s.school_id != self.school_id or s.profile_id != self.school.profile_id:
+            raise SchoolChanged(s.profile, client.profiles)
         self.client = client
-        school = s.profile.get("name") or s.profile.get("school_name") or ""
-        self.session_text = f"профиль {s.profile_id} ({school}), учебный год {s.academic_year.get('name')} (id {s.academic_year_id})"
-        self.session_short = f"вход: профиль {s.profile_id}, год {s.academic_year.get('name')}"
+        self.session_text = (f"школа {s.school_label} (профиль {s.profile_id}), "
+                             f"учебный год {s.academic_year.get('name')} (id {s.academic_year_id})")
+        self.session_short = f"вход: {s.school_label}, год {s.academic_year.get('name')}"
         log.info("вход выполнен: %s", self.session_text)
         return client
 
     def get_client_for_refdata(self) -> MeshClient:
-        """Клиент для работы с кэшем справочников: учебный год входа должен совпадать с годом кэша
+        """Клиент для работы с кэшем справочников: школа и учебный год входа должны совпадать с кэшем
         (иначе id недель и групп — чужие).  Для загрузки справочников и проверки входа — :meth:`get_client`."""
         client = self.get_client()
         if self.rd is not None:
-            self.rd.check_academic_year(client)
+            self.rd.check_session(client)
         return client
 
     def forget_client(self) -> None:
-        """Сменились токен/профиль/год: клиент заново, идущее обновление справочников — не в счёт."""
+        """Сменились токен/школа/год: клиент заново, идущее обновление справочников — не в счёт."""
         self.client, self.session_text, self.session_short = None, "", ""
         self.refresh_gen += 1
 

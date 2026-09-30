@@ -9,6 +9,7 @@ from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QDockWidget,
     QHBoxLayout,
     QLabel,
@@ -22,10 +23,11 @@ from PySide6.QtWidgets import (
 )
 
 from .. import refdata
+from ..mesh_api import ProfileChoiceRequired
 from .common import LogHandler, Worker, error, info
 from .mapping_tab import MappingTab
-from .setup_tab import SetupTab
-from .state import AppState
+from .setup_tab import SchoolDialog, SetupTab
+from .state import AppState, SchoolChanged
 from .undo_tab import UndoTab
 from .upload_tab import UploadTab
 
@@ -50,6 +52,7 @@ class MainWindow(QMainWindow):
         self.refresh_worker: Worker | None = None   # обновление справочников — отдельно, окно не блокирует
         self._refresh_again = False
         self._pending_rd: refdata.RefData | None = None
+        self._choosing_school = False           # окно выбора школы уже открыто (его могут запросить две задачи)
         # стартовый размер — не больше рабочей области экрана (ноутбуки с 768 px по высоте)
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1400, screen.width() - 40), min(900, screen.height() - 80))
@@ -136,14 +139,18 @@ class MainWindow(QMainWindow):
         parts.append("сопоставление: " + (os.path.basename(st.paths["mapping"]) or "—") + (" (не сохранено)" if st.mapping_dirty else ""))
         if st.session_short:
             parts.append(st.session_short)
+        elif st.school.label:
+            parts.append("школа: " + st.school.label)
         self.status_label.setText(" | ".join(parts))
 
     def log_text(self, text: str):
         self.log_view.appendPlainText(text)
 
-    def run(self, fn, on_done, title: str, stoppable: bool = False):
+    def run(self, fn, on_done, title: str, stoppable: bool = False, retry=None):
         """Выполняет fn(progress, message) в фоне; на время задачи вкладки недоступны.
-        stoppable — задача опрашивает :meth:`stop_requested` и умеет прерваться: показывается «Остановить»."""
+        stoppable — задача опрашивает :meth:`stop_requested` и умеет прерваться: показывается «Остановить».
+        Вход потребовал выбрать или сменить школу — после выбора вызывается retry(), без него пользователя
+        просят повторить действие (задача могла запомнить пути файлов прежней школы)."""
         if self.worker is not None and self.worker.isRunning():
             error(self, title, "Дождитесь завершения текущей задачи.")
             return
@@ -180,6 +187,15 @@ class MainWindow(QMainWindow):
 
         def failed(msg):
             finish()
+            if isinstance(w.exc, (ProfileChoiceRequired, SchoolChanged)):
+                if self.school_from_error(w.exc):
+                    if retry:
+                        retry()
+                    else:
+                        info(self, title, f"Школа: {self.state.school.label}. Повторите действие.")
+                else:
+                    error(self, title, "Школа не выбрана.")
+                return
             log.error("%s: %s", title, msg)
             error(self, title, msg)
 
@@ -244,6 +260,11 @@ class MainWindow(QMainWindow):
                 info(self, "Справочники", "Загружено: " + rd.summary())
 
         def failed(msg):
+            if isinstance(w.exc, (ProfileChoiceRequired, SchoolChanged)):
+                if self.school_from_error(w.exc):
+                    self._refresh_again = True
+                    return
+                msg = "школа не выбрана (вкладка «Данные и вход» → «Проверить вход»)"
             log.error("обновление справочников: %s", msg)
             st.refresh_error = msg
             if manual:
@@ -262,6 +283,54 @@ class MainWindow(QMainWindow):
         w.message.connect(lambda t: self.refresh_label.setText(f"справочники: {t}"))
         w.finished.connect(thread_done)          # после done/failed: поток действительно завершён
         w.start()
+
+    # ------------------------------------------------------------------ школа
+    def school_from_error(self, exc) -> bool:
+        """Вход не состоялся из-за школы: несколько школ без выбора — окно выбора; вход в другую школу
+        (первый вход) — переключиться на неё.  False — пользователь отказался выбирать."""
+        if isinstance(exc, SchoolChanged):
+            return self.switch_school(exc.profile, exc.profiles)
+        reason = ("Прежде выбранная школа недоступна. Выберите школу:" if self.state.school.profile_id is not None
+                  else "")
+        return self.pick_school(exc.profiles, reason)
+
+    def pick_school(self, profiles: list[dict], reason: str = "") -> bool:
+        """Окно выбора школы; выбранная становится текущей.  False — отменено."""
+        if self._choosing_school or not profiles:
+            return False
+        self._choosing_school = True
+        try:
+            dlg = SchoolDialog(self, profiles, self.state.school.profile_id, reason)
+            return dlg.exec() == QDialog.Accepted and self.switch_school(dlg.chosen(), profiles)
+        finally:
+            self._choosing_school = False
+
+    def switch_school(self, profile: dict, profiles: list[dict]) -> bool:
+        """Сделать школу текущей (см. AppState.choose_school).  Сопоставление перечитается из папки другой
+        школы — несохранённое сперва сохраняем: при первом входе молча (файл переедет в папку школы),
+        при смене школы — спросив.  False — пользователь отменил."""
+        st = self.state
+        sid = profile.get("school_id")
+        if st.mapping_dirty and (int(sid) if sid is not None else None) != st.school_id:
+            save = True
+            if st.school_id is not None:
+                r = QMessageBox.question(self, "Несохранённое сопоставление",
+                                         f"Сопоставление школы {st.school.label} не сохранено. Сохранить перед сменой школы?",
+                                         QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save)
+                if r == QMessageBox.Cancel:
+                    return False
+                save = r == QMessageBox.Save
+            if save:
+                try:
+                    st.save_mapping()
+                except OSError as e:
+                    error(self, "Сопоставление", str(e))
+                    return False
+        changed = st.school_id != (int(sid) if sid is not None else None)
+        st.choose_school(profile, profiles)
+        if changed:
+            self.start_refresh()
+        return True
 
     def closeEvent(self, event: QCloseEvent):
         if self.worker is not None and self.worker.isRunning():
