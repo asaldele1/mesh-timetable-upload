@@ -409,8 +409,8 @@ packaging/                  сборка самостоятельных испо
 .github/workflows/          CI (ruff + pytest) и сборка релизов
 ```
 
-Тесты на реальном файле школы (`school.chngf` в папке данных) пропускаются,
-если его нет; тесты окна входа (`tests/test_web_login.py`, локальный
+Тесты на реальном файле школы (путь — переменная `TIMETABLE_UPLOAD_SAMPLE`, по
+умолчанию `school.chngf` в папке данных) пропускаются, если его нет; тесты окна входа (`tests/test_web_login.py`, локальный
 HTTP-сервер вместо mos.ru) — если нет QtWebEngine. Проверка кода: `pip install ruff && ruff check` (настройки в
 `pyproject.toml`).
 

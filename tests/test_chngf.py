@@ -1,13 +1,15 @@
 import datetime
 import os
+import re
 
 import pytest
 
 from timetable_upload import chngf, paths
 
 HERE = os.path.dirname(__file__)
-# Реальный файл школы (лежит в папке данных, не в репозитории): тесты на нём пропускаются, если его нет.
-SAMPLE = os.path.join(paths.data_dir(), "school.chngf")
+# Реальный файл школы (не в репозитории): путь — переменная TIMETABLE_UPLOAD_SAMPLE, по умолчанию school.chngf
+# в папке данных; нет файла — тесты на нём пропускаются.  Имён людей и названия школы тесты не содержат.
+SAMPLE = os.environ.get("TIMETABLE_UPLOAD_SAMPLE") or os.path.join(paths.data_dir(), "school.chngf")
 # Демонстрационный файл из дистрибутива ХроноГрафа.
 DEMO = os.path.join(HERE, "data", "demo.chngf")
 
@@ -15,7 +17,7 @@ DEMO = os.path.join(HERE, "data", "demo.chngf")
 @pytest.fixture(scope="module")
 def tt():
     if not os.path.exists(SAMPLE):
-        pytest.skip("нет файла школы school.chngf в папке данных")
+        pytest.skip(f"нет файла школы {SAMPLE}")
     return chngf.load(SAMPLE)
 
 
@@ -30,7 +32,7 @@ def test_header(tt):
     assert (tt.day_count, tt.lesson_count, tt.week_count) == (6, 9, 1)
     assert tt.teach_year == "2025/26"
     assert tt.period_begin == datetime.date(2025, 9, 1)
-    assert tt.school_name == "Школа № 1"
+    assert tt.school_name
     assert tt.lesson_begin[0].strftime("%H:%M") == "09:00" and tt.lesson_end[0].strftime("%H:%M") == "09:45"
 
 
@@ -62,9 +64,9 @@ def test_known_lessons(tt):
     """Проверено по отчёту «Расписание классов» самой программы."""
     by_cls = tt.lessons_by_class()
     l = [x for x in by_cls["10А"] if x.day == 0 and x.lesson == 0]
-    assert [(x.subject, x.teacher, x.cabinet) for x in l] == [("Разговоры о важном", "Громова С.В.", "38")]
-    l = sorted((x.subject, x.group, x.teacher, x.cabinet) for x in by_cls["10А"] if x.day == 2 and x.lesson == 1)
-    assert l == [("Английский язык", 1, "Зуева Е.М.", "п4"), ("Английский язык", 2, "Тихонова Ольга Владимировна", "21")]
+    assert [(x.subject, x.cabinet) for x in l] == [("Разговоры о важном", "38")] and l[0].teacher
+    l = sorted((x.subject, x.group, x.cabinet, bool(x.teacher)) for x in by_cls["10А"] if x.day == 2 and x.lesson == 1)
+    assert l == [("Английский язык", 1, "п4", True), ("Английский язык", 2, "21", True)]
     # 5А, понедельник: 7 уроков, 2-й — математический практикум по трём группам
     mon = [x for x in by_cls["5А"] if x.day == 0]
     assert max(x.lesson for x in mon) == 6
@@ -73,9 +75,10 @@ def test_known_lessons(tt):
 
 def test_potok(tt):
     p = tt.potok_classes()
-    assert ("11г", "11д") in set(p.values())
-    l = [x for x in tt.iter_lessons() if x.cls == "11д" and x.subject == "Физическая культура"]
-    assert l and all(x.potok == ("11г", "11д") for x in l)
+    assert p
+    pair = sorted(set(p.values()))[0]
+    l = [x for x in tt.iter_lessons() if x.potok == pair]
+    assert l and all(x.cls in pair for x in l) and {x.cls for x in l} == set(pair)
 
 
 def test_class_busy_grid(tt):
@@ -101,10 +104,13 @@ def test_demo(demo):
 
 
 def test_teacher_names(tt):
-    t = next(t for t in tt.teachers if t.last_name == "Белова М.А.")
-    assert t.name == "Белова М.А." and t.short_name == "Белова М.А."
-    t = next(t for t in tt.teachers if t.last_name == "Морозов")
-    assert t.name == "Морозов Николай Борисович" and t.short_name == "Морозов Н.Б."
+    # ФИО одной строкой в поле фамилии («Фамилия И.О.») — имя и краткое имя совпадают с ним
+    t = next(t for t in tt.teachers if re.fullmatch(r"\S+ [А-ЯЁ]\.[А-ЯЁ]\.", t.last_name))
+    assert not t.first_name and t.name == t.short_name == t.last_name
+    # ФИО по полям — полное имя из трёх частей, краткое с инициалами
+    t = next(t for t in tt.teachers if t.first_name and t.middle_name)
+    assert t.name == f"{t.last_name} {t.first_name} {t.middle_name}"
+    assert t.short_name == f"{t.last_name} {t.first_name[0]}.{t.middle_name[0]}."
 
 
 def test_bad_file(tmp_path):
