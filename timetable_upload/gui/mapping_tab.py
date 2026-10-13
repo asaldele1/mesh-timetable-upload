@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import os
 import re
 from collections import Counter, defaultdict
 from collections.abc import Iterable
@@ -11,6 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -914,7 +916,17 @@ class MappingTab(QWidget):
         self.save_btn.clicked.connect(self.save)
         top.addWidget(self.save_btn)
         b = QPushButton("Перечитать из файла")
+        b.setToolTip("Отбросить несохранённые изменения и прочитать сопоставление школы заново")
         b.clicked.connect(self.reload)
+        top.addWidget(b)
+        b = QPushButton("Импорт…")
+        b.setToolTip("Взять сопоставление из другого файла (например, с другого компьютера) вместо текущего; "
+                     "в файл школы оно запишется по кнопке «Сохранить»")
+        b.clicked.connect(self.import_mapping)
+        top.addWidget(b)
+        b = QPushButton("Экспорт…")
+        b.setToolTip("Записать текущее сопоставление (вместе с несохранёнными изменениями) в отдельный файл")
+        b.clicked.connect(self.export_mapping)
         top.addWidget(b)
         self.summary = QLabel("")
         self.summary.setWordWrap(True)
@@ -1019,6 +1031,39 @@ class MappingTab(QWidget):
             self.state.load_mapping()
         except Exception as e:
             error(self, "Сопоставление", f"Не удалось прочитать файл:\n{e}")
+
+    def import_mapping(self):
+        st = self.state
+        path, _ = QFileDialog.getOpenFileName(self, "Импорт сопоставления", os.path.expanduser("~"),
+                                              "JSON (*.json);;Все файлы (*)")
+        if not path:
+            return
+        if st.mapping_dirty and not ask(self, "Импорт сопоставления",
+                                        "Несохранённые изменения сопоставления будут потеряны. Импортировать?"):
+            return
+        try:
+            st.import_mapping(path)
+        except Exception as e:
+            error(self, "Импорт сопоставления", f"Не удалось прочитать файл:\n{e}")
+            return
+        self.app.update_title()
+        info(self, "Импорт сопоставления", f"Сопоставление взято из {path}.\n"
+             "Проверьте его и нажмите «Сохранить»; «Перечитать из файла» вернёт прежнее.")
+
+    def export_mapping(self):
+        start = os.path.join(os.path.expanduser("~"), "mapping.json")
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт сопоставления", start, "JSON (*.json);;Все файлы (*)")
+        if not path:
+            return
+        if os.path.normpath(os.path.abspath(path)) == os.path.normpath(self.state.mapping_path):
+            error(self, "Экспорт сопоставления", "Это файл сопоставления школы — для записи в него нажмите «Сохранить».")
+            return
+        try:
+            self.state.export_mapping(path)
+        except OSError as e:
+            error(self, "Экспорт сопоставления", f"Не удалось записать файл:\n{e}")
+            return
+        info(self, "Экспорт сопоставления", f"Сопоставление записано в {path}.")
 
     def auto_match(self):
         st = self.state

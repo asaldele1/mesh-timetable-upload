@@ -6,6 +6,7 @@ import os
 import pytest
 
 from timetable_upload import cli, paths, schools
+from timetable_upload.mapping import Mapping
 from timetable_upload.mesh_api import MeshClient, ProfileChoiceRequired, school_label, teacher_profiles_of
 
 P1234 = {"id": 11, "type": "teacher", "school_id": 1234, "school_shortname": "Школа № 1", "roles": ["teacher"]}
@@ -104,6 +105,31 @@ def test_cli_paths_follow_school(data_dir):
     cli.resolve_school_paths(args)
     assert args.mapping == paths.mapping_file() and args.school_id is None       # школа ещё не выбрана
     schools.remember(P1234, [P1234, P900])
-    args = cli.build_parser().parse_args(["plan", "f.chngf", "--profile-id", "22", "--mapping", "my.json"])
+    args = cli.build_parser().parse_args(["upload", "f.chngf", "--profile-id", "22", "--journal", "my.jsonl"])
     cli.resolve_school_paths(args)
-    assert args.school_id == 900 and args.cache == schools.default_path("cache", 900) and args.mapping == "my.json"
+    assert args.school_id == 900 and args.journal == "my.jsonl"
+    assert args.cache == schools.default_path("cache", 900) and args.mapping == schools.default_path("mapping", 900)
+
+
+def test_cli_import_export_mapping(data_dir, tmp_path, capsys):
+    schools.remember(P1234, [P1234, P900])
+    own = schools.default_path("mapping", 1234)
+    src = tmp_path / "from_other_pc.json"
+    src.write_text('{"classes": {"5А": "5-А"}}', encoding="utf-8")
+    cli.main(["import-mapping", str(src)])
+    assert Mapping.load(own).classes == {"5А": "5-А"}
+    src.write_text('{"classes": {"5А": "5-Б"}}', encoding="utf-8")
+    with pytest.raises(SystemExit):              # уже есть — без --force не заменяем
+        cli.main(["import-mapping", str(src)])
+    assert Mapping.load(own).classes == {"5А": "5-А"}
+    cli.main(["import-mapping", str(src), "--force"])
+    assert Mapping.load(own).classes == {"5А": "5-Б"}
+    dest = tmp_path / "out" / "copy.json"
+    dest.parent.mkdir()
+    cli.main(["export-mapping", str(dest)])
+    assert Mapping.load(dest).classes == {"5А": "5-Б"}
+    junk = tmp_path / "junk.json"
+    junk.write_text('{"something": 1}', encoding="utf-8")
+    with pytest.raises(SystemExit):              # чужой JSON — не сопоставление
+        cli.main(["import-mapping", str(junk), "--force"])
+    assert Mapping.load(own).classes == {"5А": "5-Б"}

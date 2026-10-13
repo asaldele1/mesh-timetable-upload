@@ -278,14 +278,6 @@ class SetupTab(QWidget):
         except Exception as e:
             error(self, "Сопоставление", f"Не удалось прочитать файл сопоставления:\n{e}")
 
-    def load_refdata(self):
-        try:
-            self.state.load_refdata()
-        except Exception as e:
-            self.state.rd = None
-            self.state.changed.emit("refdata")
-            error(self, "Кэш справочников", f"Не удалось прочитать кэш:\n{e}")
-
     def web_login(self):
         try:
             from . import web_login
@@ -396,12 +388,7 @@ class AdvancedDialog(QDialog):
         b.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(paths.data_dir())))
         row.addWidget(b)
         form.addRow("Папка данных:", row)
-        form.addRow("", gray_hint("токены, логи, сессия браузера; кэш справочников, сопоставление и журнал — "
-                                  "в папке школы (schools/<id школы>), пути ниже менять обычно не нужно"))
-        self.mapping_row = PathRow(st, "mapping", "save", "JSON (*.json)", tab.load_mapping)
-        form.addRow("Сопоставление (mapping.json):", self.mapping_row)
-        self.cache_row = PathRow(st, "cache", "dir", "", tab.load_refdata)
-        form.addRow("Кэш справочников МЭШ:", self.cache_row)
+        form.addRow("", gray_hint("кэш, сопоставление и журнал — в папке школы schools/<id школы>"))
         self.journal_row = PathRow(st, "journal", "save", "JSON Lines (*.jsonl)", lambda: st.changed.emit("paths"))
         form.addRow("Журнал созданных занятий:", self.journal_row)
         row = QHBoxLayout()
@@ -438,5 +425,3 @@ class AdvancedDialog(QDialog):
     def reset_paths(self):
         self.state.forget_client()
         self.state.reset_paths()          # сигнал 'paths' обновит и надпись о входе
-        self.tab.load_mapping()
-        self.tab.load_refdata()

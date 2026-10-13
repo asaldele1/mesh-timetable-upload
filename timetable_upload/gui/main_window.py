@@ -117,7 +117,7 @@ class MainWindow(QMainWindow):
         try:
             st.load_mapping()
         except Exception as e:
-            log.error("сопоставление %s: %s", st.paths["mapping"], e)
+            log.error("сопоставление %s: %s", st.mapping_path, e)
         if st.paths["file"] and os.path.exists(st.paths["file"]):
             try:
                 st.load_file()
@@ -126,7 +126,7 @@ class MainWindow(QMainWindow):
         try:
             st.load_refdata()
         except Exception as e:
-            log.error("кэш %s: %s", st.paths["cache"], e)
+            log.error("кэш %s: %s", st.cache_path, e)
 
     # ------------------------------------------------------------------ служебное
     def update_title(self):
@@ -136,7 +136,7 @@ class MainWindow(QMainWindow):
         parts = []
         parts.append(f"файл: {name}" + (f" ({len(st.tt.classes)} кл.)" if st.tt else " (не загружен)"))
         parts.append("кэш МЭШ: " + (st.rd.academic_year.get("name", "?") if st.rd else "нет"))
-        parts.append("сопоставление: " + (os.path.basename(st.paths["mapping"]) or "—") + (" (не сохранено)" if st.mapping_dirty else ""))
+        parts.append("сопоставление: " + (os.path.basename(st.mapping_path) or "—") + (" (не сохранено)" if st.mapping_dirty else ""))
         if st.session_short:
             parts.append(st.session_short)
         elif st.school.label:
@@ -233,7 +233,7 @@ class MainWindow(QMainWindow):
         if self.refresh_worker is not None and self.refresh_worker.isRunning():
             self._refresh_again = True
             return
-        cache = st.paths["cache"] or "cache"
+        cache = st.cache_path
         gen = st.refresh_gen
 
         def job(progress, message):

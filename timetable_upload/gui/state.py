@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
+import shutil
 
 from PySide6.QtCore import QObject, QSettings, Signal
 
@@ -15,13 +16,15 @@ from ..mesh_api import MAX_WORKERS, MeshClient, MeshError
 log = logging.getLogger(__name__)
 
 
+SCHOOL_PATHS = ("journal",)     # пути к файлам школы, которые можно сменить (кэш и сопоставление — нельзя)
+
+
 def default_paths(school_id: int | None = None) -> dict[str, str]:
-    """Пути по умолчанию — в папке данных программы (см. paths.data_dir); кэш, сопоставление и журнал —
-    в папке школы (см. schools)."""
+    """Пути по умолчанию — в папке данных программы (см. paths.data_dir); журнал — в папке школы
+    (см. schools).  Кэш и сопоставление всегда в папке школы (:attr:`AppState.cache_path`,
+    :attr:`AppState.mapping_path`), их путь не меняется."""
     return {
         "file": "",
-        "cache": schools.default_path("cache", school_id),
-        "mapping": schools.default_path("mapping", school_id),
         "token_file": paths.token_file(),
         "journal": schools.default_path("journal", school_id),
         "academic_year": "",
@@ -59,9 +62,11 @@ class AppState(QObject):
         self.school_id = self.school.school_id           # школа, под которую открыты кэш, сопоставление и журнал
         defaults = default_paths(self.school_id)
         self.paths: dict[str, str] = {k: str(self.settings.value("paths/" + k, v)) for k, v in defaults.items()}
-        for key in schools.KEYS:          # стандартные пути (в т.ч. прежние общие) следуют за школой
+        for key in SCHOOL_PATHS:          # стандартные пути (в т.ч. прежние общие) следуют за школой
             if schools.is_default_path(key, self.paths[key]):
                 self.paths[key] = defaults[key]
+        self._adopt_custom_mapping()
+        self.settings.remove("paths/cache")      # прежние версии позволяли сменить папку кэша
         self.tt: chngf.Timetable | None = None
         self.rd: refdata.RefData | None = None
         self.m: Mapping = Mapping()
@@ -88,6 +93,33 @@ class AppState(QObject):
         self.settings.setValue("upload/workers", int(n))
 
     # ------------------------------------------------------------------ пути
+    @property
+    def cache_path(self) -> str:
+        """Кэш справочников — всегда в папке школы."""
+        return schools.default_path("cache", self.school_id)
+
+    @property
+    def mapping_path(self) -> str:
+        """Файл сопоставления — всегда в папке школы; другие файлы — через импорт и экспорт."""
+        return schools.default_path("mapping", self.school_id)
+
+    def _adopt_custom_mapping(self) -> None:
+        """Прежние версии позволяли указать свой файл сопоставления: если в папке школы своего ещё нет,
+        копируем тот файл туда; настройка с путём больше не нужна."""
+        old = str(self.settings.value("paths/mapping", "")).strip()
+        if not old:
+            return
+        self.settings.remove("paths/mapping")
+        dst = self.mapping_path
+        if schools.is_default_path("mapping", old) or not os.path.isfile(old) or os.path.exists(dst):
+            return
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(old, dst)
+            log.info("сопоставление %s скопировано в %s", old, dst)
+        except OSError as e:
+            log.error("не удалось скопировать сопоставление %s в %s: %s", old, dst, e)
+
     def set_path(self, key: str, value: str) -> None:
         if self.paths.get(key) == value:
             return
@@ -100,7 +132,7 @@ class AppState(QObject):
         """Вернуть стандартные пути к файлам программы (папка данных, файлы школы — в её папке); файл
         расписания и настройки входа (год, первая неделя) не трогаются."""
         for k, v in default_paths(self.school_id).items():
-            if k in ("cache", "mapping", "token_file", "journal"):
+            if k in ("token_file", "journal"):
                 self.paths[k] = v
                 self.settings.setValue("paths/" + k, "" if k in schools.KEYS else v)
         self.changed.emit("paths")
@@ -116,7 +148,7 @@ class AppState(QObject):
             old = self.school_id
             schools.migrate_legacy(self.school.school_id, len(profiles))
             self.school_id = self.school.school_id
-            for key in schools.KEYS:
+            for key in SCHOOL_PATHS:
                 if schools.is_default_path(key, self.paths[key]):
                     self.paths[key] = schools.default_path(key, self.school_id)
             log.info("школа: %s (профиль %s)%s", self.school.label, self.school.profile_id,
@@ -142,7 +174,7 @@ class AppState(QObject):
         return self.tt
 
     def load_refdata(self) -> refdata.RefData | None:
-        cache = self.paths["cache"]
+        cache = self.cache_path
         if not os.path.isdir(cache) or not os.path.exists(os.path.join(cache, "class_units.json")):
             self.rd = None
         else:
@@ -166,18 +198,39 @@ class AppState(QObject):
         self.changed.emit("refreshing")
 
     def load_mapping(self) -> Mapping:
-        self.m = Mapping.load(self.paths["mapping"])
-        self.mapping_dirty = False
+        self._set_mapping(Mapping.load(self.mapping_path), dirty=False)
+        return self.m
+
+    def _set_mapping(self, m: Mapping, dirty: bool) -> None:
+        self.m = m
+        self.mapping_dirty = dirty
         if self.rd is not None:       # индекс курсов ВД зависит от настройки в сопоставлении
             self.rd._index(self.m.ec_course_suffix)
         self.changed.emit("mapping")
-        return self.m
 
     def save_mapping(self) -> None:
-        self.m.save(self.paths["mapping"])
+        os.makedirs(os.path.dirname(self.mapping_path), exist_ok=True)
+        self.m.save(self.mapping_path)
         self.mapping_dirty = False
-        log.info("сопоставление записано в %s", self.paths["mapping"])
+        log.info("сопоставление записано в %s", self.mapping_path)
         self.changed.emit("mapping_saved")      # данные те же — построенные планы остаются в силе
+
+    def import_mapping(self, path: str) -> Mapping:
+        """Взять сопоставление из другого файла вместо текущего — в памяти, как несохранённую правку:
+        в файл школы оно попадёт при сохранении, «Перечитать из файла» вернёт прежнее."""
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"нет файла {path}")
+        m = Mapping.load(path)
+        if not Mapping.looks_like(path):
+            raise ValueError(f"{path}: это не файл сопоставления (нет ни одного из разделов {', '.join(Mapping.KEYS)})")
+        self._set_mapping(m, dirty=True)
+        log.info("сопоставление импортировано из %s (не сохранено)", path)
+        return self.m
+
+    def export_mapping(self, path: str) -> None:
+        """Записать текущее сопоставление (с несохранёнными правками) в другой файл; файл школы не меняется."""
+        self.m.save(path)
+        log.info("сопоставление экспортировано в %s", path)
 
     def mark_mapping_dirty(self) -> None:
         self.mapping_dirty = True

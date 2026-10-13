@@ -47,6 +47,8 @@ class Mapping:
         if path and os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 d = json.load(f)
+            if not isinstance(d, dict):
+                raise ValueError(f"{path}: ожидается объект JSON с разделами сопоставления")
             for k in cls.KEYS + cls.SETTINGS:
                 if k in d:
                     setattr(m, k, d[k])
@@ -55,6 +57,16 @@ class Mapping:
             except ValueError as e:
                 raise ValueError(f"{path}: {e}") from e
         return m
+
+    @classmethod
+    def looks_like(cls, path) -> bool:
+        """В файле есть хоть один раздел сопоставления (для импорта: чужой JSON — не сопоставление)."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return False
+        return isinstance(d, dict) and any(k in d for k in cls.KEYS)
 
     def check_settings(self) -> None:
         """Настройки правит пользователь (в файле или в окне): проверяем заранее, чтобы ошибка была

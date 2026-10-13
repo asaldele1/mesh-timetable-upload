@@ -62,7 +62,8 @@ def week1(args, tt: chngf.Timetable | None, rd: refdata.RefData | None = None) -
 
 def resolve_school_paths(args) -> None:
     """Школа команды — из --profile-id (по списку профилей с последнего входа) либо выбранная ранее;
-    незаданные --cache/--mapping/--journal — файлы этой школы в папке данных (см. :mod:`schools`)."""
+    кэш, сопоставление (они всегда свои у школы) и незаданный --journal — файлы этой школы в папке
+    данных (см. :mod:`schools`)."""
     cur = schools.load_current()
     pid = getattr(args, "profile_id", None)
     args.school_id = cur.school_of(pid) if pid is not None else cur.school_id
@@ -363,6 +364,29 @@ def cmd_login(args):
     sys.exit(login_main([args.token_file]))
 
 
+def cmd_export_mapping(args):
+    if not os.path.exists(args.mapping):
+        raise FileNotFoundError(f"сопоставления ещё нет ({args.mapping}) — сначала выполните match")
+    if os.path.normpath(os.path.abspath(args.dest)) == os.path.normpath(os.path.abspath(args.mapping)):
+        raise ValueError("это и есть файл сопоставления школы")
+    Mapping.load(args.mapping).save(args.dest)
+    print(f"Сопоставление {args.mapping} записано в {args.dest}")
+
+
+def cmd_import_mapping(args):
+    if not os.path.isfile(args.src):
+        raise FileNotFoundError(f"нет файла {args.src}")
+    m = Mapping.load(args.src)
+    if not Mapping.looks_like(args.src):
+        raise ValueError(f"{args.src}: это не файл сопоставления (нет ни одного из разделов {', '.join(Mapping.KEYS)})")
+    if os.path.exists(args.mapping) and not args.force:
+        raise ValueError(f"сопоставление школы уже есть ({args.mapping}); заменить — --force "
+                         f"(сохранить прежнее — export-mapping)")
+    os.makedirs(os.path.dirname(args.mapping), exist_ok=True)
+    m.save(args.mapping)
+    print(f"Сопоставление из {args.src} записано в {args.mapping}")
+
+
 def cmd_paths(args):
     cur = schools.load_current()
     items = paths.describe()
@@ -399,12 +423,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help=f"сколько запросов слать одновременно, 1–{MAX_WORKERS} (по умолчанию 8)")
 
     def cache(p):
-        p.add_argument("--cache", help=f"каталог кэша справочников МЭШ (по умолчанию {SCHOOL_DEFAULT} cache)")
+        p.set_defaults(cache=None)        # кэш справочников — всегда в папке школы
 
     def inputs(p):
         p.add_argument("file", help="файл расписания .chngf")
         cache(p)
-        p.add_argument("--mapping", help=f"файл сопоставления (по умолчанию {SCHOOL_DEFAULT} mapping.json)")
+        p.set_defaults(mapping=None)      # сопоставление — всегда файл школы; другие файлы — import-mapping/export-mapping
 
     def selection(p, classes_help=CLASSES_HELP):
         p.add_argument("--weeks", help="номера учебных недель: 16 | 16-20 | 16,18-20 (можно вместо этого --dates)")
@@ -486,6 +510,21 @@ def build_parser() -> argparse.ArgumentParser:
     selection(p, classes_help="классы через запятую, как они названы в файле ХроноГрафа")
     p.add_argument("--apply", action="store_true", help="действительно удалить")
     p.set_defaults(fn=cmd_undo)
+
+    def school(p):
+        p.add_argument("--profile-id", type=int, help="id профиля — школа, если их несколько; по умолчанию выбранная ранее")
+        p.set_defaults(mapping=None)
+
+    p = sub.add_parser("export-mapping", help="записать сопоставление школы в другой файл")
+    p.add_argument("dest", help="куда записать (.json)")
+    school(p)
+    p.set_defaults(fn=cmd_export_mapping)
+
+    p = sub.add_parser("import-mapping", help="взять сопоставление школы из другого файла")
+    p.add_argument("src", help="файл сопоставления (.json)")
+    p.add_argument("--force", action="store_true", help="заменить уже имеющееся сопоставление школы")
+    school(p)
+    p.set_defaults(fn=cmd_import_mapping)
 
     p = sub.add_parser("gui", help="графический интерфейс (нужен PySide6)")
     p.set_defaults(fn=cmd_gui)
