@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
-    QSpinBox,
     QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
@@ -28,7 +27,6 @@ from PySide6.QtWidgets import (
 )
 
 from .. import export, uploader
-from ..mesh_api import MAX_WORKERS
 from ..uploader import DAYS, Journal, Selection
 from .common import CheckListDialog, WrapDelegate, ask, check_item, error, item, make_table, scrollable
 
@@ -63,6 +61,10 @@ class UploadTab(QWidget):
         self.weeks.itemChanged.connect(self._weeks_changed)
         wl.addWidget(self.weeks)
         row = QHBoxLayout()
+        b = QPushButton("Текущая неделя")
+        b.setToolTip("Отметить только текущую учебную неделю (она выделена жирным)")
+        b.clicked.connect(self._check_current_week)
+        row.addWidget(b)
         b = QPushButton("Снять все")
         b.clicked.connect(lambda: self._check_weeks(False))
         row.addWidget(b)
@@ -121,18 +123,6 @@ class UploadTab(QWidget):
         self.replace_box.toggled.connect(lambda *_: self.invalidate())
         form.addRow("", self.replace_box)
         ll.addWidget(sbox)
-
-        wrow = QHBoxLayout()
-        self.workers_spin = QSpinBox()
-        self.workers_spin.setRange(1, MAX_WORKERS)
-        self.workers_spin.setValue(self.state.workers)
-        self.workers_spin.setToolTip("Сколько занятий отправлять на сервер одновременно (при загрузке и откате).\n"
-                                     "Если в журнале сообщений появляются ответы 429 («слишком много запросов») — уменьшите.")
-        self.workers_spin.valueChanged.connect(self.state.set_workers)
-        wrow.addWidget(self.workers_spin)
-        wrow.addWidget(QLabel("запросов одновременно"))
-        wrow.addStretch()
-        form.addRow("Параллельно:", wrow)
 
         brow = QHBoxLayout()
         self.plan_btn = QPushButton("Показать план")
@@ -223,16 +213,46 @@ class UploadTab(QWidget):
                 w1 = st.week1_monday()
             except ValueError:
                 w1 = None
+            current = self.current_week()
+            cur_row = None
             for s in sorted(st.rd.schedules, key=lambda x: x["week_number"]):
                 wk = s["week_number"]
                 r = self.weeks.rowCount()
                 self.weeks.insertRow(r)
                 self.weeks.setItem(r, 0, check_item(wk in checked))
                 self.weeks.setItem(r, 1, item(wk, wk))
-                self.weeks.setItem(r, 2, item(week_span(w1 + _dt.timedelta(days=7 * (wk - 1))) if w1 else "?"))
+                self.weeks.setItem(r, 2, item(week_span(w1 + _dt.timedelta(days=7 * (wk - 1))) if w1 else "?",
+                                              tip="текущая неделя" if wk == current else ""))
                 self.weeks.setItem(r, 3, item(""))
+                if wk == current:
+                    cur_row = r
+                    for c in (1, 2):
+                        f = self.weeks.item(r, c).font()
+                        f.setBold(True)
+                        self.weeks.item(r, c).setFont(f)
             self.weeks.fit_columns()
+            if cur_row is not None:
+                self.weeks.scrollToItem(self.weeks.item(cur_row, 1), QAbstractItemView.PositionAtTop)
         self.weeks.blockSignals(False)
+
+    def current_week(self) -> int | None:
+        """Номер текущей учебной недели (по понедельнику 1-й недели) либо None."""
+        try:
+            w1 = self.state.week1_monday()
+        except (ValueError, AttributeError):
+            return None
+        return (_dt.date.today() - w1).days // 7 + 1
+
+    def _check_current_week(self):
+        cur = self.current_week()
+        self.weeks.blockSignals(True)
+        for r in range(self.weeks.rowCount()):
+            on = self.weeks.item(r, 1).data(Qt.UserRole) == cur
+            self.weeks.item(r, 0).setCheckState(Qt.Checked if on else Qt.Unchecked)
+            if on:
+                self.weeks.scrollToItem(self.weeks.item(r, 1))
+        self.weeks.blockSignals(False)
+        self.invalidate()
 
     def _weeks_changed(self, item):
         if item.column() == 0:

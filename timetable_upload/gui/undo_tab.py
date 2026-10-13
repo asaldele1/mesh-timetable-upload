@@ -19,7 +19,7 @@ from .common import Cell, RowModel, TableView, ask, error
 
 
 class UndoTab(QWidget):
-    COLS = ["", "Вид", "Класс", "Дата", "Урок", "Группа МЭШ", "Учитель id", "Кабинет id", "Неделя", "Id занятия", "Создано"]
+    COLS = ["", "Вид", "Класс", "Дата", "Урок", "Группа МЭШ", "Учитель", "Кабинет", "Неделя", "Id занятия", "Создано"]
 
     def __init__(self, app):
         super().__init__()
@@ -66,7 +66,7 @@ class UndoTab(QWidget):
         self.reload()
 
     def _on_changed(self, what: str):
-        if what in ("paths", "journal"):
+        if what in ("paths", "journal", "refdata"):
             self.reload()
 
     def reload(self):
@@ -76,12 +76,19 @@ class UndoTab(QWidget):
         except (OSError, ValueError) as e:
             self.records = []
             error(self, "Журнал", f"Не удалось прочитать журнал {path}:\n{e}")
+        rd = self.state.rd
         rows, keys = [], []
         for rec in self.records:
-            vals = ["ВД" if rec.get("kind") == "ec" else "урок", rec.get("class"), rec.get("date"),
-                    rec.get("begin_time") or rec.get("lesson"), rec.get("group_name"), rec.get("teacher_id"),
-                    rec.get("room_id"), rec.get("week"), rec.get("item_id"), rec.get("created_at")]
-            rows.append([Cell("", False)] + [Cell("" if v is None else v) for v in vals])
+            tid, rid = rec.get("teacher_id"), rec.get("room_id")
+            teacher = (rd.teacher_by_id.get(tid) or {}).get("name") if rd and tid else None
+            room = rd.room_by_id.get(rid) if rd and rid else None
+            room_name = (room.get("number") or room.get("name")) if room else None
+            vals = [("ВД" if rec.get("kind") == "ec" else "урок", ""), (rec.get("class"), ""), (rec.get("date"), ""),
+                    (rec.get("begin_time") or rec.get("lesson"), ""), (rec.get("group_name"), ""),
+                    (teacher or tid, f"id {tid}" if tid else ""), (room_name or rid, f"id {rid}" if rid else ""),
+                    (rec.get("week"), ""), (rec.get("item_id"), ""),
+                    ((rec.get("created_at") or "").replace("T", " ")[:16], "")]
+            rows.append([Cell("", False)] + [Cell("" if v is None else v, tip=tip) for v, tip in vals])
             keys.append(journal_key(rec))     # (вид, id): у уроков и ВД разные нумерации
         self.model.set_rows(rows, keys)
         self.table.fit_columns()

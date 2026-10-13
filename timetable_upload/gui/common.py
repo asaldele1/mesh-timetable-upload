@@ -253,9 +253,10 @@ class RowModel(QAbstractTableModel):
     """
     edited = Signal(int, int)
 
-    def __init__(self, headers: list[str], editable_cols=(), check_cols=(), parent=None):
+    def __init__(self, headers: list[str], editable_cols=(), check_cols=(), parent=None, header_tips=None):
         super().__init__(parent)
         self.headers = list(headers)
+        self.header_tips = dict(header_tips or {})      # столбец → подсказка к заголовку
         self.editable_cols = frozenset(editable_cols)
         self.check_cols = frozenset(check_cols)
         self.rows: list[list[Cell]] = []
@@ -271,8 +272,11 @@ class RowModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.headers)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role == Qt.DisplayRole and orientation == Qt.Horizontal and 0 <= section < len(self.headers):
-            return self.headers[section]
+        if orientation == Qt.Horizontal and 0 <= section < len(self.headers):
+            if role == Qt.DisplayRole:
+                return self.headers[section]
+            if role == Qt.ToolTipRole:
+                return self.header_tips.get(section)
         return None
 
     def flags(self, index):
@@ -304,7 +308,9 @@ class RowModel(QAbstractTableModel):
                 return _CHECKED if self.rows[r][c].value else _UNCHECKED
             return None
         if role == _TOOLTIP:
-            return self.rows[r][c].tip or None
+            cell = self.rows[r][c]
+            # длинный текст мог не поместиться в строку (TableView.max_lines) — показываем его целиком
+            return cell.tip or (cell.text if len(cell.text) > 40 else None)
         if role == _USER:
             return self.rows[r][c].value
         return None
@@ -410,10 +416,11 @@ class TableView(_FitColumns, QTableView):
     только для строк в видимой области, при прокрутке и изменении ширины столбцов: пересчёт всех
     строк большой таблицы занимал бы секунды."""
 
-    def __init__(self, model: RowModel):
+    def __init__(self, model: RowModel, max_lines: int = 0):
         super().__init__()
         self.setModel(model)
         self._init_fit()
+        self.max_lines = max_lines             # >0 — строка не выше стольких строк текста (полный текст — в подсказке)
         # полоса прокрутки всегда: иначе её появление после измерения строк сужает область просмотра,
         # растягиваемый столбец меняет ширину, и высоты строк приходится мерить заново
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
@@ -483,8 +490,11 @@ class TableView(_FitColumns, QTableView):
             todo = [r for r in range(top, bottom + 1) if r not in self._sized and not self.isRowHidden(r)]
             if not todo:
                 break
+            cap = self.max_lines * self.fontMetrics().lineSpacing() + 8 if self.max_lines else 0
             for r in todo:
                 self.resizeRowToContents(r)
+                if cap and self.rowHeight(r) > cap:
+                    self.setRowHeight(r, cap)
                 self._sized.add(r)
             if not self._one_line:
                 # неизмеренные строки — высотой с однострочную (самая низкая ячейка первой строки),

@@ -44,6 +44,7 @@ from .common import (
     PickDialog,
     RowModel,
     TableView,
+    ask,
     error,
     info,
     item,
@@ -125,9 +126,12 @@ def _natural(s: str):
 class EntityTab(QWidget):
     """Таблица сущностей (RowModel + TableView) с фильтром по тексту и переключателем «только проблемы»."""
     headers: list[str] = []
+    header_tips: dict[int, str] = {}
+    hint = ""                          # строка-подсказка над таблицей (что делает двойной щелчок и т. п.)
     problem_col: int | None = None
     editable_cols: tuple[int, ...] = ()
     check_cols: tuple[int, ...] = ()
+    max_lines = 2                      # строка таблицы не выше двух строк текста; полный текст — в подсказке
 
     def __init__(self, owner: MappingTab):
         super().__init__()
@@ -148,9 +152,14 @@ class EntityTab(QWidget):
         top.addWidget(self.count_label)
         self.extra_controls(top)
         lay.addLayout(top)
-        self.model = RowModel(self.headers, self.editable_cols, self.check_cols, self)
+        if self.hint:
+            hint = QLabel(self.hint)
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: gray")
+            lay.addWidget(hint)
+        self.model = RowModel(self.headers, self.editable_cols, self.check_cols, self, self.header_tips)
         self.model.edited.connect(self._edited)
-        self.table = TableView(self.model)
+        self.table = TableView(self.model, self.max_lines)
         self.table.doubleClicked.connect(lambda idx: self._double_clicked(idx.row(), idx.column()))
         lay.addWidget(self.table, 1)
         self.setup_table()
@@ -197,7 +206,7 @@ class EntityTab(QWidget):
 
     def apply_filter(self) -> None:
         shown = self.table.filter(self.search.text(), self.only_problems.isChecked(), self.problem_col)
-        self.count_label.setText(f"{shown} из {self.model.rowCount()}")
+        self.count_label.setText(f"показано {shown} из {self.model.rowCount()}")
 
     def _edited(self, row: int, col: int) -> None:
         if self.ctx is None:
@@ -239,6 +248,7 @@ def _suggest(name: str, options: list[str], n: int = 3) -> str:
 # ---------------------------------------------------------------------- классы
 class ClassesTab(EntityTab):
     headers = ["Переносить", "Класс", "Полное имя", "Занятий", "Класс МЭШ", "Состояние"]
+    header_tips = {4: "двойной щелчок — выбрать класс МЭШ"}
     problem_col = 5
     COL_ON, COL_NAME, COL_FULL, COL_N, COL_MESH, COL_STATUS = range(6)
     editable_cols = (COL_MESH,)
@@ -293,7 +303,9 @@ class ClassesTab(EntityTab):
 
 # ---------------------------------------------------------------------- предметы
 class SubjectsTab(EntityTab):
-    headers = ["Переносить", "Предмет ХроноГрафа", "Уроков", "Предметы / курсы ВД в МЭШ по приоритету (двойной щелчок)", "Групп МЭШ", "Состояние"]
+    headers = ["Переносить", "Предмет ХроноГрафа", "Уроков", "Предметы МЭШ по приоритету", "Групп МЭШ", "Состояние"]
+    header_tips = {3: "предметы и курсы ВД МЭШ, среди групп которых искать группу для урока; двойной щелчок — изменить"}
+    hint = "Двойной щелчок по строке — выбрать предметы МЭШ и их порядок (приоритет)."
     problem_col = 5
     COL_ON, COL_NAME, COL_N, COL_MESH, COL_GROUPS, COL_STATUS = range(6)
     check_cols = (COL_ON,)
@@ -363,6 +375,7 @@ class SubjectsTab(EntityTab):
 # ---------------------------------------------------------------------- учителя
 class TeachersTab(EntityTab):
     headers = ["Учитель ХроноГрафа", "Уроков", "Учитель МЭШ", "Состояние"]
+    header_tips = {2: "двойной щелчок — выбрать учителя МЭШ"}
     problem_col = 3
     COL_NAME, COL_N, COL_MESH, COL_STATUS = range(4)
     editable_cols = (COL_MESH,)
@@ -403,6 +416,7 @@ class TeachersTab(EntityTab):
 # ---------------------------------------------------------------------- кабинеты
 class RoomsTab(EntityTab):
     headers = ["Кабинет ХроноГрафа", "Уроков", "Кабинет МЭШ", "Состояние"]
+    header_tips = {2: "двойной щелчок — выбрать кабинет МЭШ"}
     problem_col = 3
     COL_NAME, COL_N, COL_MESH, COL_STATUS = range(4)
     editable_cols = (COL_MESH,)
@@ -432,7 +446,7 @@ class RoomsTab(EntityTab):
                 for pfx, bid in sorted(ctx.m.room_prefixes.items()):
                     r = self.prefixes.rowCount()
                     self.prefixes.insertRow(r)
-                    self.prefixes.setItem(r, 0, item(repr(pfx), pfx))
+                    self.prefixes.setItem(r, 0, item(f"«{pfx}»" if pfx else "без префикса", pfx))
                     lab = ctx.building_label(bid) if bid else ""
                     self.prefixes.setItem(r, 1, item(lab, bid, editable=True, color=None if bid else COLOR_WARN))
                 self.prefixes.fit_columns()
@@ -480,11 +494,18 @@ class RoomsTab(EntityTab):
 class GroupsTab(EntityTab):
     """Строка на каждую классогруппу и каждый приоритет её предмета (название МЭШ, по которому в классе
     есть группы): уроки недели заполняют группу 1-го приоритета до её часов, затем 2-го и т. д."""
-    headers = ["Переносить", "Класс", "Предмет", "Гр.", "Прио.", "Учитель (двойной щелчок)", "Ур./нед", "Часов/нед",
-               "Состояние", "Группа МЭШ", "Задано вручную (двойной щелчок)", "Как выбрана"]
+    headers = ["Переносить", "Класс", "Предмет", "Гр.", "Прио.", "Учитель", "Ур./нед", "Часов/нед",
+               "Состояние", "Задано вручную", "Группа МЭШ"]
+    header_tips = {3: "подгруппа ХроноГрафа", 4: "приоритет предмета МЭШ (вкладка «Предметы»)",
+                   5: "двойной щелчок — привязать занятия к другому учителю группы МЭШ",
+                   6: "уроков в неделю по файлу", 7: "часов в неделю по нагрузке учителя в МЭШ",
+                   9: "двойной щелчок — выбрать группу МЭШ вручную",
+                   10: "группа, в которую встанут занятия; как она выбрана — в подсказке к ячейке"}
+    hint = ("Двойной щелчок: по учителю — привязать занятия к учителю группы МЭШ; по остальным столбцам — "
+            "выбрать группу вручную. Как выбрана группа — в подсказке к ячейке «Группа МЭШ».")
     problem_col = 8
-    (COL_ON, COL_CLS, COL_SUBJ, COL_GRP, COL_PRIO, COL_TEACHER, COL_N, COL_HOURS, COL_STATUS, COL_MESH, COL_MANUAL,
-     COL_WHY) = range(12)
+    (COL_ON, COL_CLS, COL_SUBJ, COL_GRP, COL_PRIO, COL_TEACHER, COL_N, COL_HOURS, COL_STATUS, COL_MANUAL,
+     COL_MESH) = range(11)
     check_cols = (COL_ON,)
     stats: Counter = Counter()                 # ok / weak / over / bad / off / ec по строкам (после заполнения)
 
@@ -510,7 +531,7 @@ class GroupsTab(EntityTab):
                              Cell(l.cls), Cell(l.subject), Cell(l.group or ""),
                              Cell(link.prio, link.prio, f"приоритет {link.prio}: {link.name or '—'}"),
                              Cell(l.teacher), Cell(n_les, n_les),
-                             Cell(""), Cell(""), Cell(""), Cell(""), Cell("")])
+                             Cell(""), Cell(""), Cell(""), Cell("")])
                 keys.append(l)
         self.model.set_rows(rows, keys)
         self._kinds = [("ok", False)] * len(rows)      # по строкам: (ok | weak | over | bad | off, группа ВД)
@@ -565,12 +586,12 @@ class GroupsTab(EntityTab):
             t_text, t_tip = self._teacher_cell(l, prio)
             touched = model.put(r, self.COL_TEACHER, t_text, tip=t_tip)
             touched |= model.put(r, self.COL_HOURS, hours, tip="часов в неделю по нагрузке учителя в МЭШ" if hours else "нет данных о нагрузке")
-            touched |= model.put(r, self.COL_MESH, ctx.group_short(g) if g else "", tip=ctx.group_label(g) if g else "")
-            touched |= model.put(r, self.COL_WHY, why, tip=why)
+            touched |= model.put(r, self.COL_MESH, ctx.group_short(g) if g else "",
+                                 tip=(ctx.group_label(g) + "\n" if g else "") + f"как выбрана: {why or '—'}")
             touched |= model.put(r, self.COL_MANUAL, ctx.group_short(eg) if eg else (f"id {explicit}" if explicit else ""),
                                  explicit, tip=ctx.group_label(eg) if eg else "")
             if touched or model.text(r, self.COL_STATUS) != status or kind != old_kind:
-                self.set_status(r, self.COL_STATUS, status, color)
+                model.put(r, self.COL_STATUS, status, tip=f"{status}: {why}" if status and why else status, color=color)
                 changed.append(r)
         self.stats = Counter(kind for kind, _ in self._kinds)
         self.stats["ec"] = sum(ec for _, ec in self._kinds)
@@ -638,7 +659,7 @@ class GroupsTab(EntityTab):
                           "; ".join(taken.get(g["id"], [])), g["id"]],
                          g["id"], g.get("subject_name") == name if name else g.get("subject_name") in names))
         auto = self.text_at(row, self.COL_MESH)
-        why = self.text_at(row, self.COL_WHY)
+        why = (self.model.cell(row, self.COL_MESH).tip.partition("как выбрана: ")[2]).strip()
         hint = (f"Занятие: {l.cls}, {l.subject}" + (f"/{l.group}" if l.group else "") + f", учитель {l.teacher or '—'}"
                 + (f"; приоритет {prio} — «{name}»" if len(names) > 1 else "") + ". "
                 + (f"Сейчас выбрана автоматически: {auto} ({why})." if auto else f"Автоматически группа не выбрана: {why or '—'}.")
@@ -946,6 +967,8 @@ class MappingTab(QWidget):
 
     def update_summary(self, why: str = ""):
         st = self.state
+        self.save_btn.setEnabled(st.mapping_dirty)
+        self.save_btn.setToolTip("" if st.mapping_dirty else "изменений нет")
         if st.tt is None or st.rd is None:
             self.summary.setText(why)
             return
@@ -989,6 +1012,9 @@ class MappingTab(QWidget):
             error(self, "Сопоставление", f"Не удалось записать файл:\n{e}")
 
     def reload(self):
+        if self.state.mapping_dirty and not ask(self, "Перечитать сопоставление",
+                                                "Несохранённые изменения сопоставления будут потеряны. Перечитать из файла?"):
+            return
         try:
             self.state.load_mapping()
         except Exception as e:

@@ -20,12 +20,13 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import auth, paths
-from ..mesh_api import fmt_roles, school_label
+from ..mesh_api import MAX_WORKERS, fmt_roles, school_label
 from .common import error, info, scrollable
 
 
@@ -39,11 +40,23 @@ def file_info_text(tt) -> str:
         f"звонки: {', '.join(f'{b:%H:%M}-{e:%H:%M}' for b, e in bells)}",
         f"Классов {len(tt.classes)}, учителей {len(tt.teachers)}, предметов {len(tt.subjects)}, кабинетов {len(tt.cabinets)}, "
         f"занятий в расписании {len(lessons)} (с кабинетом: {sum(1 for l in lessons if l.cabinet)})",
-        "Классы: " + ", ".join(c.name for c in tt.classes),
     ]
     if tt.langs:
         lines.append("Иностранные языки: " + ", ".join(l.name for l in tt.langs))
     return "\n".join(lines)
+
+
+def refdata_short(rd) -> str:
+    """Краткая сводка кэша справочников для подписи (полная — rd.summary(), в подсказке)."""
+    ay = rd.academic_year.get("name", "?")
+    when = f", загружены {rd.fetched_at:%d.%m %H:%M}" if rd.fetched_at else ""
+    return (f"учебный год {ay}{when}: классов {len(rd.class_units)}, групп {len(rd.groups)}, "
+            f"учителей {len(rd.teachers)}, недель {len(rd.schedules)}")
+
+
+def short_error(msg: str, limit: int = 90) -> str:
+    """Первая часть длинного сообщения об ошибке (до двоеточия) — для подписи; целиком — в подсказке."""
+    return msg if len(msg) <= limit else msg.split(":")[0][:limit] + "…"
 
 
 def gray_hint(text: str) -> QLabel:
@@ -150,8 +163,8 @@ class SetupTab(QWidget):
         form.addRow("Файл (.chngf):", self.file_row)
         self.file_info = QPlainTextEdit()
         self.file_info.setReadOnly(True)
-        self.file_info.setMinimumHeight(80)
-        self.file_info.setMaximumHeight(150)
+        # четыре строки сведений; фиксированная высота — иначе лишнее место формы уходит строке «Файл»
+        self.file_info.setFixedHeight(4 * self.file_info.fontMetrics().lineSpacing() + 16)
         form.addRow("Сведения о файле:", self.file_info)
         root.addWidget(files)
 
@@ -195,7 +208,7 @@ class SetupTab(QWidget):
 
         # ---- редко нужное
         row = QHBoxLayout()
-        row.addWidget(gray_hint("Токен вручную, учебный год, папка данных и пути к файлам программы:"), 1)
+        row.addWidget(gray_hint("Токен вручную, учебный год, число одновременных запросов, папка данных и пути к файлам программы:"), 1)
         b = QPushButton("Дополнительно…")
         b.clicked.connect(self.show_advanced)
         row.addWidget(b)
@@ -215,13 +228,17 @@ class SetupTab(QWidget):
             st = self.state
             rd = st.rd
             if st.refreshing:
-                text = "загружаются с сервера…" + (f" (пока используется кэш: {rd.summary()})" if rd else "")
+                text = "загружаются с сервера…" + (f" (пока используется кэш: {refdata_short(rd)})" if rd else "")
             else:
-                text = ("в кэше: " + rd.summary()) if rd else \
+                text = refdata_short(rd) if rd else \
                     "кэш пуст — войдите в МЭШ: справочники (классы, группы, учителя, кабинеты, звонки, недели, ВД) загрузятся сами"
                 if st.refresh_error:
-                    text += f"\nОбновить с сервера не удалось: {st.refresh_error}"
+                    text += f"\nОбновить с сервера не удалось: {short_error(st.refresh_error)}"
             self.cache_label.setText(text)
+            tip = rd.summary() if rd else ""
+            if st.refresh_error and not st.refreshing:
+                tip += ("\n\n" if tip else "") + st.refresh_error
+            self.cache_label.setToolTip(tip)
         elif what in ("session", "paths"):
             self.auth_label.setText(self._auth_text())
             cur = self.state.school
@@ -232,7 +249,13 @@ class SetupTab(QWidget):
         self.app.pick_school(self.state.school.profiles)      # другая школа — справочники загрузятся сами
 
     def _auth_text(self) -> str:
-        return self.state.session_text or ("вход не проверялся; " + auth.describe(self.state.paths["token_file"] or None))
+        st = self.state
+        if st.session_text:
+            return st.session_text
+        tokens = auth.describe(st.paths["token_file"] or None)
+        if tokens.startswith("токен: нет"):
+            return "вход не выполнен — нажмите «Войти через mos.ru…»"
+        return "вход не проверялся; " + tokens
 
     def show_advanced(self):
         if self.advanced is None:
@@ -298,7 +321,7 @@ class SetupTab(QWidget):
 
 
 class AdvancedDialog(QDialog):
-    """Окно «Дополнительно…»: токен вручную, учебный год, папка данных и пути к файлам программы.
+    """Окно «Дополнительно…»: токен вручную, учебный год, число одновременных запросов, папка данных и пути к файлам программы.
 
     Поля пишут в состояние сразу (как и на вкладке), так что кнопка одна — «Закрыть»."""
 
@@ -311,7 +334,7 @@ class AdvancedDialog(QDialog):
         root = QVBoxLayout(self)
 
         # ---- вход
-        mesh = QGroupBox("Вход в МЭШ")
+        mesh = QGroupBox("МЭШ")
         form = QFormLayout(mesh)
         form.setVerticalSpacing(6)
         row = QHBoxLayout()
@@ -342,6 +365,16 @@ class AdvancedDialog(QDialog):
             row.addWidget(edit)
             row.addWidget(gray_hint(tip), 1)
             form.addRow(label, row)
+        self.workers_spin = QSpinBox()
+        self.workers_spin.setRange(1, MAX_WORKERS)
+        self.workers_spin.setValue(st.workers)
+        self.workers_spin.setMaximumWidth(180)
+        self.workers_spin.valueChanged.connect(st.set_workers)
+        row = QHBoxLayout()
+        row.addWidget(self.workers_spin)
+        row.addWidget(gray_hint("сколько занятий отправлять одновременно при загрузке и откате; "
+                                "при ответах 429 («слишком много запросов») — уменьшите"), 1)
+        form.addRow("Запросов одновременно:", row)
         row = QHBoxLayout()
         b = QPushButton("Забыть сессию mos.ru")
         b.setToolTip("Удалить cookie встроенного браузера — следующий вход потребует пароль (например, для другого аккаунта)")
